@@ -209,6 +209,7 @@ jobs:
           CLIENT_USERNAME: ${{ github.event.inputs.client_username }}
           CLIENT_PAT_ENCRYPTED: ${{ github.event.inputs.client_pat }}
           TEST_CASE_REQUEST_TYPE: ${{ github.event.inputs.testCaseRequestType }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
         run: |
           set -e
 
@@ -314,11 +315,43 @@ jobs:
               python3 .pipeline-write-er.py FAILED Checkout INVALID_IMPORT_PROJECT "IMPORTED customer repository is missing package.json or could not be prepared as the Playwright project root" || true
               exit 1
             fi
+            echo "🔎 Looking for customer .env (paths only)..."
+            ENV_FOUND=""
+            for candidate in \
+              "client-tests/.env" \
+              "client-tests/.env.${ENVIRONMENT}" \
+              "client-tests/.env.local" \
+              "client-tests/environment/.env" \
+              "client-tests/environment/.env.${ENVIRONMENT}" \
+              "client-tests/config/.env" \
+              "client-tests/env/.env"
+            do
+              if [ -f "$candidate" ]; then
+                ENV_FOUND="$candidate"
+                break
+              fi
+            done
+            if [ -z "$ENV_FOUND" ]; then
+              ENV_FOUND=$(find client-tests -maxdepth 4 -type f \( -name '.env' -o -name '.env.*' \) \
+                ! -name '*.example' ! -name '*.sample' ! -name '*.template' \
+                ! -path '*/node_modules/*' ! -path '*/.git/*' 2>/dev/null | head -n 1 || true)
+            fi
+            if [ -n "$ENV_FOUND" ]; then
+              cp -a "$ENV_FOUND" /tmp/customer.env
+              echo "📄 Preserved customer env file: ${ENV_FOUND}"
+            else
+              echo "ℹ️ No .env file found in cloned customer repository"
+            fi
+
             cp -f .pipeline-write-er.py /tmp/.pipeline-write-er.py
             find . -mindepth 1 -maxdepth 1 ! -name client-tests ! -name .pipeline-write-er.py -exec rm -rf {} +
             bash -c 'shopt -s dotglob nullglob; mv client-tests/* .'
             rmdir client-tests 2>/dev/null || rm -rf client-tests
             cp -f /tmp/.pipeline-write-er.py .pipeline-write-er.py
+            if [ -f /tmp/customer.env ]; then
+              cp -a /tmp/customer.env .env
+              echo "📄 Customer .env placed at workspace root"
+            fi
             if [ ! -f package.json ]; then
               echo "::error::IMPORTED customer repository is missing package.json or could not be prepared as the Playwright project root"
               python3 .pipeline-write-er.py FAILED Checkout INVALID_IMPORT_PROJECT "IMPORTED customer repository is missing package.json or could not be prepared as the Playwright project root" || true
@@ -355,6 +388,8 @@ jobs:
       # are not set — they would override $GITHUB_ENV. Secrets persist via ::add-mask:: + $GITHUB_ENV.
       - name: Load customer runtime environment
         env:
+          TEST_CASE_REQUEST_TYPE: ${{ github.event.inputs.testCaseRequestType }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
           GHA_BASE_URL: ${{ secrets.BASE_URL || vars.BASE_URL }}
           GHA_USER_NAME: ${{ secrets.USER_NAME || vars.USER_NAME }}
           GHA_PASSWORD: ${{ secrets.PASSWORD || vars.PASSWORD }}
@@ -364,8 +399,10 @@ jobs:
           python3 <<'PY'
           import os
           import re
+          import shlex
           import secrets as pysecrets
           import sys
+          from pathlib import Path
 
           KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
           SECRET_RE = re.compile(
@@ -374,21 +411,24 @@ jobs:
               re.I,
           )
           RESERVED_EXACT = {
-              "CI",
-              "METADATA_FILE",
-              "NPM_HASH_FILE",
-              "ENCRYPTION_KEY",
-              "AWS_ENCRYPTION_KEY",
-              "PATH",
-              "HOME",
-              "USER",
-              "GITHUB_ENV",
-              "GITHUB_OUTPUT",
-              "GITHUB_PATH",
-              "GITHUB_STEP_SUMMARY",
-              "GITHUB_WORKSPACE",
+              "CI", "METADATA_FILE", "NPM_HASH_FILE", "ENCRYPTION_KEY",
+              "AWS_ENCRYPTION_KEY", "PATH", "HOME", "USER", "SHELL",
+              "GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH",
+              "GITHUB_STEP_SUMMARY", "GITHUB_WORKSPACE",
           }
           RESERVED_PREFIXES = ("GITHUB_", "RUNNER_", "ACTIONS_")
+          ALIASES = {
+              "USERNAME": "USER_NAME",
+              "USEREMAIL": "USER_NAME",
+              "LOGIN": "USER_NAME",
+              "PASS": "PASSWORD",
+              "PASSWD": "PASSWORD",
+              "PWD": "PASSWORD",
+              "BASEURL": "BASE_URL",
+              "APP_URL": "BASE_URL",
+              "SITE_URL": "BASE_URL",
+              "PLAYWRIGHT_BASE_URL": "BASE_URL",
+          }
           FALLBACKS = {
               "BASE_URL": os.environ.get("GHA_BASE_URL", ""),
               "USER_NAME": os.environ.get("GHA_USER_NAME", ""),
@@ -415,26 +455,43 @@ jobs:
                   sys.stdout.write(f"::add-mask::{part}\n")
               sys.stdout.flush()
 
+          def read_text(path):
+              data = Path(path).read_bytes()
+              if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+                  return data.decode("utf-16")
+              return data.decode("utf-8-sig")
+
           def parse_env_file(path):
               parsed = {}
-              with open(path, "r", encoding="utf-8-sig") as fh:
-                  for raw in fh:
-                      line = raw.strip()
-                      if not line or line.startswith("#"):
-                          continue
-                      if line.lower().startswith("export "):
-                          line = line[7:].lstrip()
-                      if "=" not in line:
-                          continue
+              for raw in read_text(path).splitlines():
+                  line = raw.strip().strip("\ufeff")
+                  if not line or line.startswith("#"):
+                      continue
+                  if line.lower().startswith("export "):
+                      line = line[7:].lstrip()
+                  if "=" in line:
                       name, value = line.split("=", 1)
-                      name = name.strip()
-                      if not KEY_RE.match(name) or is_reserved(name):
-                          continue
-                      value = value.strip()
-                      if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-                          value = value[1:-1]
-                      if value:
-                          parsed[name] = value
+                  elif ":" in line:
+                      name, value = line.split(":", 1)
+                  else:
+                      continue
+                  name = name.strip()
+                  if not KEY_RE.match(name) or is_reserved(name):
+                      continue
+                  value = value.strip()
+                  quoted = len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"')
+                  if quoted:
+                      value = value[1:-1]
+                  elif " #" in value:
+                      value = value.split(" #", 1)[0].rstrip()
+                  value = value.replace("\\n", "\n").replace("\\t", "\t")
+                  if value:
+                      parsed[name] = value
+              for src, dest in ALIASES.items():
+                  if parsed.get(dest):
+                      continue
+                  if parsed.get(src):
+                      parsed[dest] = parsed[src]
               return parsed
 
           def write_github_env(name, value, secret):
@@ -446,39 +503,89 @@ jobs:
               with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
                   envf.write(f"{name}<<{delim}\n{value}\n{delim}\n")
 
-          request_type = (os.environ.get("TEST_CASE_REQUEST_TYPE") or "").strip()
-          env_path = os.path.join(os.getcwd(), ".env")
+          def find_dotenv(environment):
+              names = [".env", ".env.local"]
+              if environment:
+                  env = environment.strip()
+                  names.extend([f".env.{env}", f".env.{env.lower()}"])
+                  if env.lower() == "dev":
+                      names.append(".env.development")
+                  if env.lower() == "staging":
+                      names.append(".env.staging")
+              dirs = [Path("."), Path("environment"), Path("config"), Path("env")]
+              for directory in dirs:
+                  for name in names:
+                      candidate = directory / name
+                      if candidate.is_file() and candidate.name not in (
+                          ".env.example", ".env.sample", ".env.template",
+                      ):
+                          return candidate
+              extra = Path("/tmp/customer.env")
+              if extra.is_file():
+                  return extra
+              for match in Path(".").rglob(".env"):
+                  if any(p in match.parts for p in ("node_modules", ".git")):
+                      continue
+                  if match.is_file():
+                      return match
+              return None
+
+          request_type = (os.environ.get("TEST_CASE_REQUEST_TYPE") or "").strip().replace("\r", "")
+          environment = (os.environ.get("ENVIRONMENT") or "").strip()
+          exported = {}
           loaded_from_dotenv = []
           loaded_from_gha = []
 
-          if request_type == "IMPORTED":
-              if os.path.isfile(env_path):
-                  print("📄 IMPORTED: .env found at workspace root (after customer repo promote)")
-                  for name, value in parse_env_file(env_path).items():
+          if request_type.upper() == "IMPORTED":
+              env_file = find_dotenv(environment)
+              if env_file is not None:
+                  print(f"📄 IMPORTED: loading customer env file (path only): {env_file.as_posix()}")
+                  parsed = parse_env_file(env_file)
+                  for name, value in parsed.items():
                       write_github_env(name, value, is_secret_key(name))
+                      exported[name] = value
                       loaded_from_dotenv.append(name)
                   if loaded_from_dotenv:
                       print("🔑 Loaded from customer .env (names only): " + ", ".join(loaded_from_dotenv))
+                      print(
+                          "🔑 Required present from .env: "
+                          + ", ".join(
+                              k for k in ("BASE_URL", "USER_NAME", "PASSWORD") if k in exported
+                          )
+                          or "(none)"
+                      )
                   else:
                       print("ℹ️ Customer .env contained no exportable KEY=value entries")
               else:
-                  print("ℹ️ IMPORTED: no .env at workspace root — using GitHub Actions secrets/vars fallback")
+                  print("ℹ️ IMPORTED: no .env found — using GitHub Actions secrets/vars fallback")
           else:
               print("ℹ️ RECORDED_OR_UPLOADED: skipping customer .env; using GitHub Actions secrets/vars")
 
-          already = set(loaded_from_dotenv)
           for name, value in FALLBACKS.items():
               value = (value or "").strip()
-              if not value or name in already:
+              if not value or exported.get(name):
                   continue
               write_github_env(name, value, is_secret_key(name))
+              exported[name] = value
               loaded_from_gha.append(name)
 
           if loaded_from_gha:
               print("🔑 Applied GitHub secrets/vars fallback (names only): " + ", ".join(loaded_from_gha))
 
+          runtime_path = "/tmp/gha-runtime.env"
+          with open(runtime_path, "w", encoding="utf-8") as shellf:
+              for name, value in exported.items():
+                  shellf.write(f"{name}={shlex.quote(value)}\n")
+          os.chmod(runtime_path, 0o600)
           print("✅ Runtime environment ready for subsequent steps (values not printed)")
           PY
+          if [ -f /tmp/gha-runtime.env ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . /tmp/gha-runtime.env
+            set +a
+          fi
+          echo "🔎 Required runtime keys set (yes/no, values not printed): BASE_URL=$([ -n "${BASE_URL:-}" ] && echo yes || echo no) USER_NAME=$([ -n "${USER_NAME:-}" ] && echo yes || echo no) PASSWORD=$([ -n "${PASSWORD:-}" ] && echo yes || echo no)"
 
       # 4. Validate Inputs
       - name: Validate Inputs
@@ -487,7 +594,14 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ github.event.inputs.aws_secret_access_key }}
           SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
         run: |
+          set +x
           set -e
+          if [ -f /tmp/gha-runtime.env ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . /tmp/gha-runtime.env
+            set +a
+          fi
           missing=""
           [ -z "${AWS_ACCESS_KEY_ID// }" ] && missing="$missing aws_access_key_id"
           [ -z "${AWS_SECRET_ACCESS_KEY// }" ] && missing="$missing aws_secret_access_key"
@@ -649,7 +763,14 @@ jobs:
         env:
           BROWSER: ${{ github.event.inputs.browser }}
         run: |
+          set +x
           set -e
+          if [ -f /tmp/gha-runtime.env ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . /tmp/gha-runtime.env
+            set +a
+          fi
           if [ "${TEST_CASE_REQUEST_TYPE}" = "IMPORTED" ]; then
             echo "📦 IMPORT Setup — customer dependencies"
             if [ ! -f package.json ]; then
@@ -943,7 +1064,14 @@ jobs:
           ENVIRONMENT: ${{ github.event.inputs.environment }}
           WORKERS: ${{ github.event.inputs.workers }}
         run: |
+          set +x
           set -e
+          if [ -f /tmp/gha-runtime.env ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . /tmp/gha-runtime.env
+            set +a
+          fi
 
           # --- helpers: executionResult + Failure_Validation.zip (Jenkins parity) ---
           write_execution_result() {
