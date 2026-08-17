@@ -112,10 +112,6 @@ jobs:
       CI: 'true'
       METADATA_FILE: metadata.json
       NPM_HASH_FILE: .npm-install-hash
-      PASSWORD: ${{ secrets.PASSWORD || vars.PASSWORD }}
-      BASE_URL: ${{ secrets.BASE_URL || vars.BASE_URL }}
-      USER_NAME: ${{ secrets.USER_NAME || vars.USER_NAME }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || vars.OPENAI_API_KEY }}
       SELF_HEAL_ENABLED: ${{ vars.SELF_HEAL_ENABLED || 'false' }}
       ALL_SCREENSHOT_ENABLED: ${{ vars.ALL_SCREENSHOT_ENABLED || 'false' }}
       ENCRYPTION_KEY: ${{ secrets.AWS_ENCRYPTION_KEY || secrets.ENCRYPTION_KEY || secrets['aws-encryption-key'] }}
@@ -329,6 +325,11 @@ jobs:
               exit 1
             fi
             echo "✅ IMPORT customer Playwright project ready at workspace root"
+            if [ -f .env ]; then
+              echo "📄 Customer .env is present at workspace root after promote"
+            else
+              echo "ℹ️ No .env at workspace root after promote"
+            fi
           else
             if [ ! -d "client-tests/tests" ]; then
               echo "::error::client-tests/tests not found in client repository"
@@ -348,6 +349,136 @@ jobs:
             fi
             echo "✅ tests/ directory verified"
           fi
+
+      # 3b. IMPORTED: load customer .env at workspace root (then GHA secrets/vars fallback).
+      # RECORDED_OR_UPLOADED: GitHub Secrets/vars only. Job-level BASE_URL/USER_NAME/PASSWORD
+      # are not set — they would override $GITHUB_ENV. Secrets persist via ::add-mask:: + $GITHUB_ENV.
+      - name: Load customer runtime environment
+        env:
+          GHA_BASE_URL: ${{ secrets.BASE_URL || vars.BASE_URL }}
+          GHA_USER_NAME: ${{ secrets.USER_NAME || vars.USER_NAME }}
+          GHA_PASSWORD: ${{ secrets.PASSWORD || vars.PASSWORD }}
+          GHA_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || vars.OPENAI_API_KEY }}
+        run: |
+          set +x
+          python3 <<'PY'
+          import os
+          import re
+          import secrets as pysecrets
+          import sys
+
+          KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+          SECRET_RE = re.compile(
+              r"(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|_KEY$|^KEY$|"
+              r"AWS_ACCESS|AWS_SECRET|PRIVATE_KEY|CREDENTIAL|CLIENT_PAT|^PAT$|AUTH)",
+              re.I,
+          )
+          RESERVED_EXACT = {
+              "CI",
+              "METADATA_FILE",
+              "NPM_HASH_FILE",
+              "ENCRYPTION_KEY",
+              "AWS_ENCRYPTION_KEY",
+              "PATH",
+              "HOME",
+              "USER",
+              "GITHUB_ENV",
+              "GITHUB_OUTPUT",
+              "GITHUB_PATH",
+              "GITHUB_STEP_SUMMARY",
+              "GITHUB_WORKSPACE",
+          }
+          RESERVED_PREFIXES = ("GITHUB_", "RUNNER_", "ACTIONS_")
+          FALLBACKS = {
+              "BASE_URL": os.environ.get("GHA_BASE_URL", ""),
+              "USER_NAME": os.environ.get("GHA_USER_NAME", ""),
+              "PASSWORD": os.environ.get("GHA_PASSWORD", ""),
+              "OPENAI_API_KEY": os.environ.get("GHA_OPENAI_API_KEY", ""),
+          }
+
+          def is_reserved(name):
+              return name in RESERVED_EXACT or name.startswith(RESERVED_PREFIXES)
+
+          def is_secret_key(name):
+              return bool(SECRET_RE.search(name))
+
+          def emit_mask(value):
+              if not value:
+                  return
+              parts = [value]
+              parts.extend(value.splitlines())
+              seen = set()
+              for part in parts:
+                  if part in seen or len(part) < 3:
+                      continue
+                  seen.add(part)
+                  sys.stdout.write(f"::add-mask::{part}\n")
+              sys.stdout.flush()
+
+          def parse_env_file(path):
+              parsed = {}
+              with open(path, "r", encoding="utf-8-sig") as fh:
+                  for raw in fh:
+                      line = raw.strip()
+                      if not line or line.startswith("#"):
+                          continue
+                      if line.lower().startswith("export "):
+                          line = line[7:].lstrip()
+                      if "=" not in line:
+                          continue
+                      name, value = line.split("=", 1)
+                      name = name.strip()
+                      if not KEY_RE.match(name) or is_reserved(name):
+                          continue
+                      value = value.strip()
+                      if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                          value = value[1:-1]
+                      if value:
+                          parsed[name] = value
+              return parsed
+
+          def write_github_env(name, value, secret):
+              if secret:
+                  emit_mask(value)
+              delim = "ghadelim_" + pysecrets.token_hex(8)
+              while delim in value:
+                  delim = "ghadelim_" + pysecrets.token_hex(8)
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
+                  envf.write(f"{name}<<{delim}\n{value}\n{delim}\n")
+
+          request_type = (os.environ.get("TEST_CASE_REQUEST_TYPE") or "").strip()
+          env_path = os.path.join(os.getcwd(), ".env")
+          loaded_from_dotenv = []
+          loaded_from_gha = []
+
+          if request_type == "IMPORTED":
+              if os.path.isfile(env_path):
+                  print("📄 IMPORTED: .env found at workspace root (after customer repo promote)")
+                  for name, value in parse_env_file(env_path).items():
+                      write_github_env(name, value, is_secret_key(name))
+                      loaded_from_dotenv.append(name)
+                  if loaded_from_dotenv:
+                      print("🔑 Loaded from customer .env (names only): " + ", ".join(loaded_from_dotenv))
+                  else:
+                      print("ℹ️ Customer .env contained no exportable KEY=value entries")
+              else:
+                  print("ℹ️ IMPORTED: no .env at workspace root — using GitHub Actions secrets/vars fallback")
+          else:
+              print("ℹ️ RECORDED_OR_UPLOADED: skipping customer .env; using GitHub Actions secrets/vars")
+
+          already = set(loaded_from_dotenv)
+          for name, value in FALLBACKS.items():
+              value = (value or "").strip()
+              if not value or name in already:
+                  continue
+              write_github_env(name, value, is_secret_key(name))
+              loaded_from_gha.append(name)
+
+          if loaded_from_gha:
+              print("🔑 Applied GitHub secrets/vars fallback (names only): " + ", ".join(loaded_from_gha))
+
+          print("✅ Runtime environment ready for subsequent steps (values not printed)")
+          PY
 
       # 4. Validate Inputs
       - name: Validate Inputs
@@ -387,7 +518,11 @@ jobs:
           [ -z "$PASSWORD" ] && missing_secrets="$missing_secrets PASSWORD"
           if [ -n "$missing_secrets" ]; then
             echo "::error::Missing required environment secrets/vars:$missing_secrets"
-            echo "Add them under Settings → Secrets and variables → Actions."
+            if [ "${TEST_CASE_REQUEST_TYPE}" = "IMPORTED" ]; then
+              echo "For IMPORTED, set them in the customer .env at the repository root, or as GitHub Actions secrets/vars fallback."
+            else
+              echo "Add them under Settings → Secrets and variables → Actions."
+            fi
             exit 1
           fi
           echo "✅ Inputs validated"
