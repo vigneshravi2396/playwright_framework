@@ -1,0 +1,23 @@
+{
+  "name": "playwright_framework_repo",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vigneshravi2396/playwright_framework_repo.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/vigneshravi2396/playwright_framework_repo/issues"
+  },
+  "homepage": "https://github.com/vigneshravi2396/playwright_framework_repo#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/node": "^26.1.0"
+  }
+}
