@@ -1,0 +1,2995 @@
+            pipeline {
+                agent none
+
+                parameters {
+                    string(
+                        name: 'client_repo_url',
+                        defaultValue: 'https://github.com/qadence-ai/boilerplate-qa.git',
+                        description: 'Client tests repository URL (e.g. https://github.com/company/client-tests.git)'
+                    )
+                    string(
+                        name: 'client_branch',
+                        defaultValue: 'vignesh_test_poc_new',
+                        description: 'Branch to checkout from the client tests repository'
+                    )
+                    string(
+                        name: 'client_username',
+                        defaultValue: 'qadence-ideas2it',
+                        description: 'Username for client repository checkout'
+                    )
+                    string(
+                        name: 'client_pat',
+                        defaultValue: '',
+                        description: 'AES-256-CBC encrypted GitHub PAT for client repository checkout'
+                    )
+                    string(
+                        name: 'aws_access_key_id',
+                        defaultValue: '',
+                        description: 'AES-256-CBC encrypted AWS access key ID for S3 upload'
+                    )
+                    string(
+                        name: 'aws_secret_access_key',
+                        defaultValue: '',
+                        description: 'AES-256-CBC encrypted AWS secret access key for S3 upload'
+                    )
+                    // New Requirement: suite_testcase JSON mapping suites to test files
+                    text(
+                        name: 'suite_testcase',
+                        defaultValue: '',
+                        description: 'JSON map of suite names to testcase files (use "all" for full suite)'
+                    )
+                    choice(
+                        name: 'browser',
+                        choices: ['chrome', 'firefox', 'webkit', 'chromium'],
+                        description: 'Browser to run tests on'
+                    )
+                    choice(
+                        name: 'environment',
+                        choices: ['dev', 'staging', 'example'],
+                        description: 'Target environment for secrets'
+                    )
+                    string(
+                        name: 's3_prefix',
+                        defaultValue: '/testing/results/upload/2026-06-17_07-43-21/staging',
+                        description: 'Folder path inside the S3 bucket'
+                    )
+                    string(
+                        name: 'aws_region',
+                        defaultValue: 'us-east-1',
+                        description: 'AWS region for S3 upload'
+                    )
+                    string(name: 'test_run_id', defaultValue: '', description: 'Run ID for this execution')
+                    string(name: 'tenantId', defaultValue: '', description: 'Tenant ID for this execution')
+                    string(name: 'applicationId', defaultValue: '', description: 'App ID for this execution')
+                    string(name: 'test_execution_id', defaultValue: '', description: 'Test Execution ID')
+                    string(name: 'test_execution_request_id', defaultValue: '', description: 'Test Execution Request ID')
+                    string(
+                        name: 'testCaseRequestType',
+                        defaultValue: '',
+                        description: 'Type of testcase request. Allowed values: RECORDED_OR_UPLOADED or IMPORTED'
+                    )
+                    string(
+                        name: 'workers',
+                        defaultValue: '4',
+                        description: 'Number of parallel workers'
+                    )
+                }
+
+                environment {
+                    CI = 'true'
+                    METADATA_FILE = 'metadata.json'
+                    BUILD_UNIQUE_ID = "build-${BUILD_NUMBER}-${BUILD_ID}"
+                    BROWSER_CACHE_FILE = '/tmp/.playwright-browsers-verified'
+                    NPM_HASH_FILE = '.npm-install-hash'
+                    // Single configurable Docker image for IMPORT / RECORDER / UPLOAD
+                    DOCKER_AGENT_IMAGE = 'playwright-taas:latest'
+                    DOCKER_AGENT_ARGS = '--shm-size=2gb -u root'
+                }
+
+                options {
+                    buildDiscarder(logRotator(numToKeepStr: '15', artifactNumToKeepStr: '10'))
+                    timestamps()
+                    timeout(time: 2, unit: 'HOURS')
+                    skipDefaultCheckout(true)
+                }
+
+                stages {
+                    // Host: checkout (+ IMPORT: framework → ensure image → customer) + log Playwright version
+                    stage('Prepare Checkout and Docker Image') {
+                        agent { label 'built-in' }
+                        steps {
+                            script {
+                                try {
+                                    echo '🧹 Cleaning workspace before pipeline execution...'
+                                    cleanWorkspace()
+                                    echo '✅ Workspace prepared'
+
+                                    if (isImportedRequest()) {
+                                        // IMPORT replaces the workspace with the customer repo — build image first while jenkins/Dockerfile exists
+                                        echo '🔄 IMPORT — checking out framework repository (Docker build context)...'
+                                        prepareWorkspaceForCheckout()
+                                        checkoutFrameworkRepository()
+                                        echo '================ AFTER FRAMEWORK CHECKOUT ================'
+                                        sh '''
+                                            set +e
+                                            echo "PWD:"
+                                            pwd
+
+                                            echo ""
+                                            echo "Top level:"
+                                            ls -lrta
+
+                                            echo ""
+                                            echo "Workspace tree (depth 3):"
+                                            find . -maxdepth 3 | sort
+
+                                            echo ""
+                                            echo "Framework src:"
+                                            ls -lrta src || true
+
+                                            echo ""
+                                            echo "Framework tests:"
+                                            ls -lrta tests || true
+
+                                            echo "========================================================="
+                                        '''
+                                        ensurePlaywrightDockerImagePulled(getDockerAgentImage())
+                                        env.DOCKER_AGENT_ARGS = env.DOCKER_AGENT_ARGS ?: '--shm-size=2gb -u root'
+                                        echo "🐳 Docker image ready: ${getDockerAgentImage()}"
+
+                                        echo '🔄 IMPORT — checking out customer repository...'
+                                        checkoutImportedCustomerRepository()
+                                        echo '================ AFTER CUSTOMER CHECKOUT ================'
+                                        sh '''
+                                            set +e
+                                            echo "PWD:"
+                                            pwd
+
+                                            echo ""
+                                            echo "Top level:"
+                                            ls -lrta
+
+                                            echo ""
+                                            echo "Workspace tree (depth 4):"
+                                            find . -maxdepth 4 | sort
+
+                                            echo ""
+                                            echo "Root src:"
+                                            ls -lrta src || true
+
+                                            echo ""
+                                            echo "Root tests:"
+                                            ls -lrta tests || true
+
+                                            echo ""
+                                            echo "Customer repo:"
+                                            ls -lrta client-tests || true
+
+                                            echo "========================================================="
+                                        '''
+                                    } else {
+                                        echo '🔄 Checking out repository...'
+                                        checkoutRepository()
+                                        ensurePlaywrightDockerImagePulled(getDockerAgentImage())
+                                        env.DOCKER_AGENT_ARGS = env.DOCKER_AGENT_ARGS ?: '--shm-size=2gb -u root'
+                                    }
+
+                                    echo '✅ Checkout completed successfully'
+                                    logWorkspaceAfterCheckout()
+                                    logDetectedPlaywrightVersion()
+                                    echo "🐳 Pipeline will run inside: ${getDockerAgentImage()}"
+                                } catch (Exception e) {
+                                    writeExecutionResult('FAILED', 'Prepare Checkout and Docker Image', 'UNEXPECTED_ERROR', "Prepare/checkout/image resolve failed: ${e.message}")
+                                    error("❌ Prepare/checkout/image resolve failed: ${e.message}")
+                                }
+                            }
+                        }
+                    }
+
+                    // Host agent + docker.inside(getDockerAgentImage())
+                    stage('Run Pipeline') {
+                        agent { label 'built-in' }
+                        steps {
+                            script {
+                                def image = getDockerAgentImage()
+                                def args = getPlaywrightDockerArgs()
+                                echo "🐳 Entering Playwright container: ${image} (${args})"
+                                docker.image(image).inside(args) {
+                                    stage('Ensure CI Tools') {
+                                        ensureCiToolsInContainer()
+                                    }
+
+                                    stage('Debug Workspace') {
+                                        echo '🔍 Inspecting workspace structure...'
+                                        sh '''
+                                            pwd
+                                            ls -la
+                                            find . -maxdepth 3
+                                        '''
+                                        echo '⏳ Waiting 2 seconds...'
+                                        sleep(time: 2, unit: 'SECONDS')
+                                    }
+
+                                    stage('Validate Suite') {
+                                        def suiteTestcase = parseSuiteTestcase()
+                                        cacheSuitePathMap(discoverSuitePaths())
+                                        validateSuiteTestcase(suiteTestcase)
+                                    }
+
+                                    stage('Setup') {
+                                        withEnv(['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']) {
+                                            def filteredSuites = readPipelineJsonMap(
+                                                env.FILTERED_SUITE_TESTCASE_FILE ?: '.pipeline-filtered-suite-testcase.json'
+                                            )
+                                            if (!filteredSuites) {
+                                                env.SKIP_PLAYWRIGHT = 'true'
+                                                echo '⏭️ Skipping Setup — no valid suites after suite validation'
+                                            } else {
+                                                try {
+                                                    echo '📦 Installing dependencies...'
+                                                    if (isImportedRequest()) {
+                                                        installImportedDependencies()
+                                                        ensureImportedPlaywrightChromeInstalled()
+                                                    } else {
+                                                        installDependenciesOptimized()
+                                                        ensurePlaywrightBrowsersInstalled()
+                                                    }
+                                                    echo '✅ Setup completed successfully'
+                                                } catch (Exception e) {
+                                                    writeExecutionResult('FAILED', 'Setup', 'SETUP_FAILED', "Setup failed: ${e.message}")
+                                                    error("❌ Setup failed: ${e.message}")
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    stage('Validate Testcases') {
+                                        if (env.SKIP_PLAYWRIGHT == 'true') {
+                                            echo '⏭️ Skipping Validate Testcases — no valid suites'
+                                        } else {
+                                            // Shared Recorder/Upload/IMPORT validation (titles via --list, files via find)
+                                            validateTestcaseFiles(parseSuiteTestcase())
+                                        }
+                                    }
+
+                                    stage('Create Metadata') {
+                                        try {
+                                            createMetadata()
+                                        } catch (Exception e) {
+                                            writeExecutionResult('FAILED', 'Create Metadata', 'METADATA_FAILED', "Metadata creation failed: ${e.message}")
+                                            error("❌ Metadata creation failed: ${e.message}")
+                                        }
+                                    }
+
+                                    stage('Execute Tests') {
+                                        try {
+                                            timeout(time: 100, unit: 'MINUTES') {
+                                                if (env.SKIP_PLAYWRIGHT == 'true') {
+                                                    finalizeValidationOnlyRun()
+                                                } else if (isImportedRequest()) {
+                                                    runImportedSuiteTestcases()
+                                                } else {
+                                                    runSuiteTestcases()
+                                                }
+                                            }
+                                        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                                            echo '⏱️ Test execution timed out'
+                                            writeExecutionResult('FAILED', 'Execute Tests', 'TIMEOUT', 'Test execution timed out')
+                                            currentBuild.result = 'UNSTABLE'
+                                        } catch (Exception e) {
+                                            echo "⚠️ Test execution encountered errors: ${e.message}"
+                                            writeExecutionResult('FAILED', 'Execute Tests', 'UNEXPECTED_ERROR', "Test execution encountered errors: ${e.message}")
+                                            currentBuild.result = 'UNSTABLE'
+                                        }
+                                    }
+
+                                    stage('Upload to S3') {
+                                        try {
+                                            uploadAllPendingZips()
+                                        } catch (Exception e) {
+                                            writeExecutionResult('FAILED', 'Upload to S3', 'UPLOAD_FAILED', "S3 upload failed: ${e.message}")
+                                            currentBuild.result = 'FAILURE'
+                                            error("S3 upload failed: ${e.message}")
+                                        }
+                                    }
+
+                                    stage('Archive Artifacts') {
+                                        try {
+                                            echo '📦 Archiving artifacts...'
+                                            archiveArtifacts(
+                                                artifacts: '**/*.zip,metadata.json,test_status*.json,test_summary.json',
+                                                allowEmptyArchive: true,
+                                                fingerprint: false,
+                                                onlyIfSuccessful: false
+                                            )
+                                        } catch (Exception e) {
+                                            echo "⚠️ Artifact archiving failed: ${e.message}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                post {
+                    always {
+                        script {
+                            printSummary()
+                            try {
+                                node('built-in') {
+                                    def hasExecutionResult = false
+                                    if (fileExists(env.METADATA_FILE)) {
+                                        try {
+                                            def meta = readJSON(file: env.METADATA_FILE)
+                                            hasExecutionResult = (meta?.executionResult != null)
+                                        } catch (Exception ignored) {
+                                            hasExecutionResult = false
+                                        }
+                                    }
+                                    if (!hasExecutionResult) {
+                                        def buildStatus = currentBuild.result ?: 'SUCCESS'
+                                        if (buildStatus == 'SUCCESS') {
+                                            writeExecutionResult('SUCCESS', 'Completed', '', 'Execution completed successfully')
+                                        } else {
+                                            writeExecutionResult('FAILED', 'Completed', 'UNEXPECTED_ERROR', "Pipeline ended with status ${buildStatus}")
+                                        }
+                                    }
+                                    archiveArtifacts(
+                                        artifacts: 'metadata.json',
+                                        allowEmptyArchive: true,
+                                        fingerprint: false,
+                                        onlyIfSuccessful: false
+                                    )
+                                }
+                            } catch (Exception e) {
+                                echo "⚠️ Failed to archive metadata.json: ${e.message}"
+                            }
+                            try {
+                                // cleanWorkspace() — temporarily disabled for debugging
+                                // node('built-in') {
+                                //     echo '🧹 Cleaning workspace after pipeline execution...'
+                                //     cleanWorkspace()
+                                //     echo '✅ Workspace cleaned'
+                                // }
+                                echo '⚠️ Workspace cleanup skipped for debugging.'
+                            } catch (Exception e) {
+                                echo "⚠️ Final workspace cleanup failed: ${e.message}"
+                            }
+                        }
+                    }
+
+                    success {
+                        echo '✅ Pipeline completed successfully!'
+                    }
+
+                    unstable {
+                        echo '⚠️ Pipeline unstable - Some tests failed or upload issues occurred'
+                    }
+
+                    failure {
+                        script {
+                            echo '❌ Pipeline failed - Check logs for details'
+                            try {
+                                node('built-in') {
+                                    uploadFailureArtifactsIfNeeded()
+                                }
+                            } catch (Exception e) {
+                                echo "⚠️ Failure artifact upload failed: ${e.message}"
+                            }
+                        }
+                    }
+
+                    aborted {
+                        echo '🛑 Pipeline aborted by user'
+                    }
+                }
+            }
+
+            // ============================================================================
+            // OPTIMIZED UTILITY FUNCTIONS - ALL FIXED
+            // ============================================================================
+
+            // Force Jenkins env / GString / wrappers into a plain java.lang.String
+            def toPlainString(def value) {
+                if (value == null) {
+                    return ''
+                }
+                return value.toString()
+            }
+
+            // Recursively convert maps/lists to plain JSON-safe Java types for writeJSON
+            // (avoids GString / JSONObject / JSONArray / EnvVars wrapper serialization)
+            def toPlainJsonValue(def value) {
+                if (value == null) {
+                    return null
+                }
+                if (value instanceof Boolean) {
+                    return value
+                }
+                if (value instanceof Number) {
+                    return value
+                }
+                if (value instanceof CharSequence) {
+                    return value.toString()
+                }
+                if (value instanceof Map) {
+                    def out = [:]
+                    value.each { k, v ->
+                        out[k.toString()] = toPlainJsonValue(v)
+                    }
+                    return out
+                }
+                if (value instanceof Collection) {
+                    def out = []
+                    value.each { item ->
+                        out.add(toPlainJsonValue(item))
+                    }
+                    return out
+                }
+                // Unknown Jenkins wrappers → plain string
+                return value.toString()
+            }
+
+            // Structured execution result stored inside metadata.json → executionResult
+            def writeExecutionResult(String status, String stage, String errorCode, String message) {
+                if (fileExists(env.METADATA_FILE)) {
+                    try {
+                        def metadata = readJSON(file: env.METADATA_FILE)
+                        def existing = metadata?.executionResult
+                        def existingStatus = (existing?.status ?: '').toString()
+                        def existingCode = (existing?.errorCode ?: '').toString()
+
+                        // Once validation recorded PARTIAL_*, never overwrite (ZIP / Playwright / post hooks)
+                        if (existingStatus == 'PARTIAL_SUCCESS' || existingStatus == 'PARTIAL_FAILED') {
+                            echo "📝 executionResult already ${existingStatus} — preserving validation result (incoming status=${status}, errorCode=${errorCode ?: 'N/A'})"
+                            return
+                        }
+
+                        // Playwright failure is primary — do not let ZIP packaging overwrite UNSTABLE/PLAYWRIGHT_FAILED
+                        if (existingStatus == 'UNSTABLE' && existingCode == 'PLAYWRIGHT_FAILED' && errorCode == 'ZIP_CREATION_FAILED') {
+                            echo 'executionResult already recorded (PLAYWRIGHT_FAILED) — keeping Playwright execution result over ZIP packaging failure'
+                            return
+                        }
+
+                        if (status == 'FAILED') {
+                            if (existingStatus == 'FAILED') {
+                                def newIsGeneric = (errorCode == 'UNEXPECTED_ERROR')
+                                def existingIsSpecific = existingCode && existingCode != 'UNEXPECTED_ERROR'
+                                if (newIsGeneric && existingIsSpecific) {
+                                    echo "📝 executionResult already recorded (${existingCode}) — keeping specific failure over UNEXPECTED_ERROR"
+                                    return
+                                }
+                            }
+                        }
+                    } catch (Exception ignored) {
+                        // proceed to write
+                    }
+                }
+
+                def timestamp = sh(script: 'date -u +%Y-%m-%dT%H:%M:%SZ', returnStdout: true).trim()
+                // Explicit plain strings — never store env.BUILD_* / GString directly
+                def buildNumber = toPlainString(env.BUILD_NUMBER)
+                def buildUrl = toPlainString(env.BUILD_URL)
+                def result = [
+                    status     : toPlainString(status),
+                    stage      : toPlainString(stage),
+                    message    : toPlainString(message),
+                    timestamp  : toPlainString(timestamp),
+                    buildNumber: buildNumber,
+                    buildUrl   : buildUrl
+                ]
+                if (errorCode?.trim()) {
+                    result.errorCode = toPlainString(errorCode)
+                }
+
+                syncExecutionResultToMetadata(toPlainJsonValue(result))
+                echo "📝 metadata.json executionResult written: status=${status}, stage=${stage}, errorCode=${errorCode ?: 'N/A'}"
+            }
+
+            // Convert readJSON / net.sf.json.JSONArray to a plain Groovy ArrayList.
+            // JSONArray.join(String) is blocked by Script Security; ArrayList.join is allowed.
+            def toGroovyList(def value) {
+                def result = []
+                if (value == null) {
+                    return result
+                }
+                value.each { item ->
+                    result.add(item == null ? null : item.toString())
+                }
+                return result
+            }
+
+            // Track ZIP names for multi-upload (success + Failure_*.zip) without JsonOutput
+            def addPendingUploadZip(String zipName) {
+                def file = '.pipeline-upload-zips.json'
+                def zips = []
+                if (fileExists(file)) {
+                    def existing = readJSON(file: file)
+                    zips = toGroovyList(existing)
+                }
+                if (zipName?.trim() && !zips.contains(zipName)) {
+                    zips.add(zipName)
+                }
+                writeJSON(file: file, json: zips)
+                env.PENDING_UPLOAD_ZIPS_FILE = file
+            }
+
+            def uploadAllPendingZips() {
+                def file = env.PENDING_UPLOAD_ZIPS_FILE ?: '.pipeline-upload-zips.json'
+                def zips = []
+                if (fileExists(file)) {
+                    zips = toGroovyList(readJSON(file: file))
+                }
+                if (env.ZIP_NAME?.trim() && fileExists(env.ZIP_NAME) && !zips.contains(env.ZIP_NAME)) {
+                    zips.add(0, env.ZIP_NAME)
+                }
+                if (!zips) {
+                    uploadToS3Optimized(env.ZIP_NAME)
+                    return
+                }
+                echo "📤 Uploading ${zips.size()} ZIP(s) to S3: ${zips.join(', ')}"
+                zips.each { zipName ->
+                    uploadToS3Optimized(zipName as String)
+                }
+            }
+
+            // Lightweight Failure_<label>.zip (metadata + failure_info) — does NOT upload (Upload stage does)
+            def packageValidationFailureZip(String label, Map failureInfo) {
+                def safeLabel = label.toString().replaceAll(/[^A-Za-z0-9._-]/, '_')
+                def zipName = "Failure_${safeLabel}.zip"
+                def suiteDir = "Failure_${safeLabel}"
+                ensureMinimalMetadata()
+                writeJSON(file: '.pipeline-failure-info-tmp.json', json: toPlainJsonValue(failureInfo))
+                sh """
+                    set -e
+                    echo "📦 Creating validation failure package: ${zipName}"
+                    mkdir -p "${suiteDir}"
+                    cp "${env.METADATA_FILE}" "${suiteDir}/" 2>/dev/null || true
+                    cp .pipeline-failure-info-tmp.json "${suiteDir}/failure_info.json"
+                    zip -r -q -6 "${zipName}" "${suiteDir}"
+                    rm -rf "${suiteDir}"
+                    ls -lh "${zipName}"
+                """
+                addPendingUploadZip(zipName)
+                echo "✅ Failure ZIP ready: ${zipName}"
+                return zipName
+            }
+
+            def readPipelineJsonList(String fileName) {
+                if (!fileExists(fileName)) {
+                    return []
+                }
+                return toGroovyList(readJSON(file: fileName))
+            }
+
+            def readPipelineJsonMap(String fileName) {
+                if (!fileExists(fileName)) {
+                    return [:]
+                }
+                def data = readJSON(file: fileName)
+                if (!(data instanceof Map)) {
+                    return [:]
+                }
+                // Copy to plain map; convert nested JSONArray/List values via toGroovyList
+                def result = [:]
+                data.each { key, value ->
+                    if (value instanceof Collection) {
+                        result[key.toString()] = toGroovyList(value)
+                    } else {
+                        result[key.toString()] = value
+                    }
+                }
+                return result
+            }
+
+            // Write final executionResult once (SUCCESS / PARTIAL_FAILED / FAILED) + validation lists
+            // Shared by Recorder/Upload and IMPORT — validation PARTIAL_FAILED takes precedence over PLAYWRIGHT_FAILED
+            def writeFinalValidationExecutionResult(int playwrightExitCode, boolean didExecute) {
+                def validSuites = readPipelineJsonList('.pipeline-valid-suites.json')
+                def failedSuites = readPipelineJsonList('.pipeline-failed-suites.json')
+                def validTestcases = readPipelineJsonList('.pipeline-executed-testcases.json')
+                def missingTestcases = readPipelineJsonList('.pipeline-missing-testcases.json')
+
+                def hasSuiteFailures = failedSuites && !failedSuites.isEmpty()
+                def hasTestcaseFailures = missingTestcases && !missingTestcases.isEmpty()
+
+                if (!didExecute) {
+                    // Case 4: everything invalid
+                    def errorCode = hasSuiteFailures ? 'SUITE_NOT_FOUND' : 'TESTCASE_NOT_FOUND'
+                    def msg = hasSuiteFailures
+                        ? "All requested suites were invalid: ${failedSuites.join(', ')}"
+                        : "All requested testcases were invalid: ${missingTestcases.join(', ')}"
+                    writeExecutionResult('FAILED', 'Completed', errorCode, msg)
+                    mergeValidationListsIntoExecutionResult(validSuites, failedSuites, validTestcases, missingTestcases)
+                    return
+                }
+
+                if (hasSuiteFailures || hasTestcaseFailures) {
+                    // Case 1 / 2: PARTIAL_FAILED (validation gaps — not a Playwright runtime failure)
+                    def errorCode = hasSuiteFailures ? 'PARTIAL_SUITE_NOT_FOUND' : 'PARTIAL_TESTCASE_NOT_FOUND'
+                    def msgParts = []
+                    if (hasSuiteFailures) {
+                        msgParts.add("${validSuites.size()} suite(s) valid, ${failedSuites.size()} suite(s) not found")
+                    }
+                    if (hasTestcaseFailures) {
+                        msgParts.add("${validTestcases.size()} testcase(s) executed, ${missingTestcases.size()} testcase(s) not found")
+                    }
+                    writeExecutionResult('PARTIAL_FAILED', 'Completed', errorCode, msgParts.join('. ') + '.')
+                    mergeValidationListsIntoExecutionResult(validSuites, failedSuites, validTestcases, missingTestcases)
+                    return
+                }
+
+                if (playwrightExitCode != 0) {
+                    writeExecutionResult('UNSTABLE', 'Execute Tests', 'PLAYWRIGHT_FAILED', "Playwright tests failed with exit code: ${playwrightExitCode}")
+                    return
+                }
+
+                // Case 3: everything valid
+                writeExecutionResult('SUCCESS', 'Completed', '', 'Execution completed successfully')
+            }
+
+            def mergeValidationListsIntoExecutionResult(List validSuites, List failedSuites, List validTestcases, List missingTestcases) {
+                if (!fileExists(env.METADATA_FILE)) {
+                    return
+                }
+                def metadata = readJSON(file: env.METADATA_FILE)
+                if (!(metadata.executionResult instanceof Map)) {
+                    return
+                }
+                // Always store plain ArrayList<String> — never JSONArray / wrappers
+                def plainValidSuites = toGroovyList(validSuites)
+                def plainFailedSuites = toGroovyList(failedSuites)
+                def plainValidTestcases = toGroovyList(validTestcases)
+                def plainMissingTestcases = toGroovyList(missingTestcases)
+
+                metadata.executionResult.validSuites = plainValidSuites
+                metadata.executionResult.failedSuites = plainFailedSuites
+                metadata.executionResult.validTestcases = plainValidTestcases
+                metadata.executionResult.missingTestcases = plainMissingTestcases
+                // Also expose on metadata root for consumers
+                metadata.validSuites = plainValidSuites
+                metadata.failedSuites = plainFailedSuites
+                metadata.validTestcases = plainValidTestcases
+                metadata.missingTestcases = plainMissingTestcases
+
+                // Re-normalize entire metadata tree before writeJSON
+                writeJSON(file: env.METADATA_FILE, json: toPlainJsonValue(metadata), pretty: 4)
+                sh "cat ${env.METADATA_FILE} || true"
+            }
+
+            // Create ONE Failure_Validation.zip aggregating all invalid suites + missing testcases
+            def packageAllValidationFailureZips() {
+                def failedSuites = toGroovyList(readPipelineJsonList('.pipeline-failed-suites.json'))
+                def missingBySuite = readPipelineJsonMap('.pipeline-missing-by-suite.json')
+                def invalidTestcases = [:]
+                missingBySuite.each { suite, missingList ->
+                    invalidTestcases[suite.toString()] = toGroovyList(missingList)
+                }
+
+                def failureInfo = [
+                    invalidSuites    : failedSuites,
+                    invalidTestcases : invalidTestcases
+                ]
+
+                echo "📦 Packaging single Failure_Validation.zip (invalidSuites=${failedSuites.size()}, suitesWithMissingTestcases=${invalidTestcases.size()})"
+                packageValidationFailureZip('Validation', failureInfo)
+            }
+
+            // Case 4 path: no Playwright — write FAILED, create one Failure_Validation.zip
+            def finalizeValidationOnlyRun() {
+                echo '❌ No valid suites/testcases to execute — packaging Failure_Validation.zip'
+                writeFinalValidationExecutionResult(0, false)
+                packageAllValidationFailureZips()
+                env.ZIP_NAME = ''
+                currentBuild.result = 'FAILURE'
+            }
+
+            // Merge/update only executionResult in metadata.json (create minimal metadata if missing)
+            def syncExecutionResultToMetadata(def result) {
+                def metadata
+                if (fileExists(env.METADATA_FILE)) {
+                    metadata = readJSON(file: env.METADATA_FILE)
+                } else {
+                    def timestamp = sh(script: 'date -u +%Y-%m-%dT%H:%M:%SZ', returnStdout: true).trim()
+                    metadata = [
+                        tenantId                  : toPlainString(params.tenantId ?: 'N/A'),
+                        applicationId             : toPlainString(params.applicationId ?: 'N/A'),
+                        test_run_id               : toPlainString(params.test_run_id ?: 'N/A'),
+                        test_execution_id         : toPlainString(params.test_execution_id ?: 'N/A'),
+                        test_execution_request_id : toPlainString(params.test_execution_request_id ?: 'N/A'),
+                        testCaseRequestType       : toPlainString(params.testCaseRequestType ?: 'N/A'),
+                        browser                   : toPlainString(params.browser),
+                        environment               : toPlainString(params.environment),
+                        buildNumber               : toPlainString(env.BUILD_NUMBER),
+                        buildUrl                  : toPlainString(env.BUILD_URL),
+                        timestamp                 : toPlainString(timestamp)
+                    ]
+                }
+                metadata.executionResult = toPlainJsonValue(result)
+                writeJSON(file: env.METADATA_FILE, json: toPlainJsonValue(metadata), pretty: 4)
+                echo '📝 metadata.json updated with executionResult'
+                sh "cat ${env.METADATA_FILE} || true"
+            }
+
+            // Minimal metadata when Create Metadata never ran (early failure package)
+            def ensureMinimalMetadata() {
+                if (fileExists(env.METADATA_FILE)) {
+                    echo "✅ metadata.json already exists — reusing for failure package"
+                    return
+                }
+                def timestamp = sh(script: 'date -u +%Y-%m-%dT%H:%M:%SZ', returnStdout: true).trim()
+                def metadata = [
+                    tenantId                  : toPlainString(params.tenantId ?: 'N/A'),
+                    applicationId             : toPlainString(params.applicationId ?: 'N/A'),
+                    test_run_id               : toPlainString(params.test_run_id ?: 'N/A'),
+                    test_execution_id         : toPlainString(params.test_execution_id ?: 'N/A'),
+                    test_execution_request_id : toPlainString(params.test_execution_request_id ?: 'N/A'),
+                    testCaseRequestType       : toPlainString(params.testCaseRequestType ?: 'N/A'),
+                    browser                   : toPlainString(params.browser),
+                    environment               : toPlainString(params.environment),
+                    buildNumber               : toPlainString(env.BUILD_NUMBER),
+                    buildUrl                  : toPlainString(env.BUILD_URL),
+                    timestamp                 : toPlainString(timestamp)
+                ]
+                writeJSON(file: env.METADATA_FILE, json: toPlainJsonValue(metadata), pretty: 4)
+                echo '✅ Minimal metadata.json created for failure package'
+            }
+
+            // Lightweight failure ZIP (metadata.json only) then upload via existing uploader
+            def packageAndUploadFailureArtifacts() {
+                ensureMinimalMetadata()
+                def hasExecutionResult = false
+                try {
+                    def meta = readJSON(file: env.METADATA_FILE)
+                    hasExecutionResult = (meta?.executionResult != null)
+                } catch (Exception ignored) {
+                    hasExecutionResult = false
+                }
+                if (!hasExecutionResult) {
+                    writeExecutionResult('FAILED', 'Unknown', 'UNEXPECTED_ERROR', 'Pipeline failed before execution result was recorded')
+                }
+
+                def datetime = sh(script: "date +'%Y%m%d_%H%M%S'", returnStdout: true).trim()
+                def suiteDir = "failure_${datetime}"
+                def zipName = "failure_${datetime}.zip"
+
+                sh """
+                    set -e
+                    echo "📦 Creating lightweight failure package: ${zipName}"
+                    mkdir -p "${suiteDir}"
+                    cp "${env.METADATA_FILE}" "${suiteDir}/"
+                    zip -r -q -6 "${zipName}" "${suiteDir}"
+                    rm -rf "${suiteDir}"
+                    ls -lh "${zipName}"
+                """
+
+                env.ZIP_NAME = zipName
+                uploadToS3Optimized(zipName)
+            }
+
+            // Ensure exactly one ZIP reaches S3 on FAILURE when the success upload path did not run
+            def createOrUploadFailureZip() {
+                if (env.ZIP_NAME?.trim() && fileExists(env.ZIP_NAME)) {
+                    echo "📦 ZIP exists but was not uploaded — uploading existing ZIP: ${env.ZIP_NAME}"
+                    uploadToS3Optimized(env.ZIP_NAME)
+                } else {
+                    echo '📦 Creating lightweight failure ZIP for S3 upload...'
+                    packageAndUploadFailureArtifacts()
+                }
+            }
+
+            def uploadFailureArtifactsIfNeeded() {
+                if (env.ZIP_UPLOADED == 'true') {
+                    echo '✅ ZIP already uploaded to S3 — skipping failure package'
+                    return
+                }
+
+                def image = getDockerAgentImage()
+                def imageExists = sh(
+                    script: "docker image inspect ${image} >/dev/null 2>&1",
+                    returnStatus: true
+                ) == 0
+
+                if (imageExists) {
+                    docker.image(image).inside(getPlaywrightDockerArgs()) {
+                        createOrUploadFailureZip()
+                    }
+                } else {
+                    echo "⚠️ Docker image ${image} not available — packaging/uploading on host"
+                    createOrUploadFailureZip()
+                }
+            }
+
+            // Two-repository checkout: framework repo + client tests repo
+            def checkoutRepository() {
+                prepareWorkspaceForCheckout()
+                checkoutFrameworkRepository()
+                echo '================ AFTER FRAMEWORK CHECKOUT ================'
+                sh '''
+                    set +e
+                    echo "PWD:"
+                    pwd
+
+                    echo ""
+                    echo "Top level:"
+                    ls -lrta
+
+                    echo ""
+                    echo "Workspace tree (depth 3):"
+                    find . -maxdepth 3 | sort
+
+                    echo ""
+                    echo "Framework src:"
+                    ls -lrta src || true
+
+                    echo ""
+                    echo "Framework tests:"
+                    ls -lrta tests || true
+
+                    echo "========================================================="
+                '''
+                checkoutClientTestsRepository()
+                echo '================ AFTER CUSTOMER CHECKOUT ================'
+                sh '''
+                    set +e
+                    echo "PWD:"
+                    pwd
+
+                    echo ""
+                    echo "Top level:"
+                    ls -lrta
+
+                    echo ""
+                    echo "Workspace tree (depth 4):"
+                    find . -maxdepth 4 | sort
+
+                    echo ""
+                    echo "Root src:"
+                    ls -lrta src || true
+
+                    echo ""
+                    echo "Root tests:"
+                    ls -lrta tests || true
+
+                    echo ""
+                    echo "Customer repo:"
+                    ls -lrta client-tests || true
+
+                    echo "========================================================="
+                '''
+                materializeTestsFromClientRepository()
+                validateTestsDirectory()
+            }
+
+            // True only when testCaseRequestType is exactly IMPORTED (empty / RECORDED_OR_UPLOADED → existing flow)
+            def isImportedRequest() {
+                return (params.testCaseRequestType ?: '').trim() == 'IMPORTED'
+            }
+
+            // Debug: workspace contents immediately after successful checkout (IMPORT / RECORDER / UPLOAD)
+            def logWorkspaceAfterCheckout() {
+                sh '''
+                    echo "================ Workspace After Checkout ================"
+                    pwd
+                    echo "Current Directory:"
+                    pwd
+
+                    echo ""
+                    echo "Top-level files:"
+                    ls -lah
+
+                    echo ""
+                    echo "Recursive workspace structure:"
+                    find . -maxdepth 3 | sort
+
+                    echo "=========================================================="
+                '''
+            }
+
+            // Shared: locate package.json used for Playwright version logging (all request types)
+            def locatePackageJsonForPlaywrightVersion() {
+                // Prefer customer clone when it declares @playwright/test (RECORDED/UPLOADED before/while client-tests exists)
+                if (fileExists('client-tests/package.json')) {
+                    try {
+                        def clientPkg = readJSON(file: 'client-tests/package.json')
+                        if (clientPkg?.devDependencies?.get('@playwright/test')?.toString()?.trim()) {
+                            echo '📄 Using client-tests/package.json for Playwright version'
+                            return 'client-tests/package.json'
+                        }
+                    } catch (Exception ignored) {
+                        // fall through to workspace root
+                    }
+                }
+                if (fileExists('package.json')) {
+                    echo '📄 Using ./package.json for Playwright version'
+                    return 'package.json'
+                }
+                return null
+            }
+
+            // Shared: normalize @playwright/test from package.json (logging / debug only)
+            def extractPlaywrightVersionFromPackageJson(String packageJsonPath = null) {
+                def path = packageJsonPath ?: locatePackageJsonForPlaywrightVersion()
+                if (!path) {
+                    echo '⚠️ package.json not found — cannot log Playwright version'
+                    return null
+                }
+                def pkg = readJSON(file: path)
+                def raw = pkg?.devDependencies?.get('@playwright/test')
+                if (!raw?.toString()?.trim()) {
+                    echo "⚠️ devDependencies[\"@playwright/test\"] missing in ${path}"
+                    return null
+                }
+                def text = raw.toString().trim()
+                def normalized = text.replaceAll(/^[\^~>=<\s=]+/, '').trim()
+                def matcher = (normalized =~ /(\d+\.\d+\.\d+)/)
+                if (!matcher.find()) {
+                    echo "⚠️ Unable to parse Playwright version from '${text}' in ${path}"
+                    return null
+                }
+                def version = matcher.group(1)
+                echo "📦 @playwright/test raw='${text}' → normalized='${version}' (from ${path})"
+                return version
+            }
+
+            // Single source of truth: env.DOCKER_AGENT_IMAGE (e.g. playwright-taas:latest)
+            def getDockerAgentImage() {
+                def img = env.DOCKER_AGENT_IMAGE?.toString()?.trim()
+                if (!img || img == 'null') {
+                    error('DOCKER_AGENT_IMAGE is not set')
+                }
+                return img
+            }
+
+            // Backward-compatible alias — always returns DOCKER_AGENT_IMAGE
+            def getPlaywrightDockerImage() {
+                return getDockerAgentImage()
+            }
+
+            def getPlaywrightDockerArgs() {
+                def args = env.DOCKER_AGENT_ARGS?.toString()?.trim()
+                return args ? args : '--shm-size=2gb -u root'
+            }
+
+            // Detect Playwright version for logging only — does NOT select Docker image
+            def logDetectedPlaywrightVersion() {
+                try {
+                    def version = extractPlaywrightVersionFromPackageJson()
+                    if (version) {
+                        env.PLAYWRIGHT_DETECTED_VERSION = version
+                        echo "📦 Detected Playwright version (debug only): ${version}"
+                        echo "🐳 Docker image is NOT derived from this version — using DOCKER_AGENT_IMAGE=${getDockerAgentImage()}"
+                    } else {
+                        echo "⚠️ Playwright version not detected (debug only) — continuing with DOCKER_AGENT_IMAGE=${getDockerAgentImage()}"
+                    }
+                } catch (Exception e) {
+                    echo "⚠️ Playwright version detection failed (debug only): ${e.message}"
+                }
+            }
+
+            // Ensure common DOCKER_AGENT_IMAGE is present locally (use existing, else build from jenkins/Dockerfile — never pull custom image)
+            def ensurePlaywrightDockerImagePulled(String image = null) {
+                def target = (image?.trim()) ? image.trim() : getDockerAgentImage()
+                def exists = sh(
+                    script: "docker image inspect ${target} >/dev/null 2>&1",
+                    returnStatus: true
+                ) == 0
+                if (exists) {
+                    echo "✅ Docker image already present locally: ${target}"
+                    return
+                }
+
+                echo "ℹ️ Docker image not found locally: ${target}"
+                echo "🐳 Building Docker image ${target} from jenkins/Dockerfile (custom image — no docker pull)"
+                def buildStatus = sh(
+                    script: "docker build -t ${target} -f jenkins/Dockerfile .",
+                    returnStatus: true
+                )
+                if (buildStatus != 0) {
+                    writeExecutionResult(
+                        'FAILED',
+                        'Prepare Checkout and Docker Image',
+                        'DOCKER_BUILD_FAILED',
+                        "Failed to build Docker image ${target} from jenkins/Dockerfile"
+                    )
+                    error("Failed to build Docker image ${target} from jenkins/Dockerfile")
+                }
+
+                def built = sh(
+                    script: "docker image inspect ${target} >/dev/null 2>&1",
+                    returnStatus: true
+                ) == 0
+                if (!built) {
+                    writeExecutionResult(
+                        'FAILED',
+                        'Prepare Checkout and Docker Image',
+                        'DOCKER_BUILD_FAILED',
+                        "Docker build reported success but image ${target} was not found"
+                    )
+                    error("Docker build reported success but image ${target} was not found")
+                }
+                echo "✅ Built and verified Docker image: ${target}"
+            }
+
+            // Shared: zip + aws required by packaging / S3 (official Playwright images may omit them)
+            def ensureCiToolsInContainer() {
+                sh '''
+                    set -e
+                    export DEBIAN_FRONTEND=noninteractive
+                    if ! command -v zip >/dev/null 2>&1; then
+                        apt-get update -qq
+                        apt-get install -y -qq zip
+                    fi
+                    if ! command -v aws >/dev/null 2>&1; then
+                        apt-get update -qq
+                        if ! apt-get install -y -qq awscli; then
+                            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+                            unzip -q /tmp/awscliv2.zip -d /tmp
+                            /tmp/aws/install
+                            rm -rf /tmp/aws /tmp/awscliv2.zip
+                        fi
+                    fi
+                    command -v zip
+                    command -v aws
+                '''
+            }
+
+            // Shared: launch-based browser usability check (not a directory existence check)
+            def arePlaywrightBrowsersUsable() {
+                def browserParam = toPlainString(params.browser)
+                def engine = [
+                    chrome  : 'chromium',
+                    chromium: 'chromium',
+                    firefox : 'firefox',
+                    webkit  : 'webkit'
+                ].get(browserParam, 'chromium')
+
+                echo "🔍 Validating Playwright browser usability (engine=${engine}, browser=${browserParam})..."
+                def status = sh(
+                    returnStatus: true,
+                    script: """
+                        set +e
+                        export PLAYWRIGHT_BROWSERS_PATH="\${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright}"
+                        node -e '
+                          const engine = "${engine}";
+                          let pw;
+                          try { pw = require("playwright"); }
+                          catch (e1) {
+                            try { pw = require("@playwright/test"); }
+                            catch (e2) { console.error(e2); process.exit(1); }
+                          }
+                          const launcher = pw[engine];
+                          if (!launcher || typeof launcher.launch !== "function") {
+                            console.error("No launcher for engine:", engine);
+                            process.exit(1);
+                          }
+                          launcher.launch({ headless: true })
+                            .then((browser) => browser.close())
+                            .then(() => { console.log("Playwright browser launch OK:", engine); process.exit(0); })
+                            .catch((err) => { console.error(err); process.exit(1); });
+                        '
+                    """
+                )
+                return status == 0
+            }
+
+            // Shared: skip install when browsers already launch; otherwise install + --with-deps
+            def ensurePlaywrightBrowsersInstalled() {
+                if (arePlaywrightBrowsersUsable()) {
+                    echo 'Playwright browsers already installed. Skipping browser installation.'
+                    return
+                }
+                echo '📦 Playwright browsers not usable — running install'
+                def pwStatus = timeout(time: 20, unit: 'MINUTES') {
+                    sh(
+                        script: '''
+                            set -e
+                            npx playwright install
+                            npx playwright install --with-deps
+                        ''',
+                        returnStatus: true
+                    )
+                }
+                if (pwStatus != 0) {
+                    writeExecutionResult('FAILED', 'Setup', 'SETUP_FAILED', "playwright install failed with exit code: ${pwStatus}")
+                    error("playwright install failed with exit code: ${pwStatus}")
+                }
+                echo '✅ Playwright browsers installed'
+            }
+
+            // IMPORT: reuse shared launch-based usability check
+            def areImportedPlaywrightBrowsersUsable() {
+                return arePlaywrightBrowsersUsable()
+            }
+
+            // IMPORT: install Google Chrome only (no Firefox/WebKit, no --with-deps)
+            def ensureImportedPlaywrightChromeInstalled() {
+                if (areImportedPlaywrightBrowsersUsable()) {
+                    echo 'Playwright Chrome already available. Skipping installation.'
+                    return
+                }
+                echo 'Chrome not found. Installing Playwright Chrome...'
+                def pwStatus = timeout(time: 20, unit: 'MINUTES') {
+                    sh(
+                        script: '''
+                            set -e
+                            npx playwright install chrome
+                        ''',
+                        returnStatus: true
+                    )
+                }
+                if (pwStatus != 0) {
+                    writeExecutionResult('FAILED', 'Setup', 'SETUP_FAILED', "playwright install failed with exit code: ${pwStatus}")
+                    error("playwright install failed with exit code: ${pwStatus}")
+                }
+                echo 'Playwright Chrome installation completed.'
+            }
+
+            // IMPORT flow: checkout customer Playwright project and promote it to workspace root
+            // so existing validation / metadata / packaging relative paths keep working.
+            def checkoutImportedCustomerRepository() {
+                echo '📥 IMPORT checkout — customer repository is the Playwright project root'
+                prepareWorkspaceForCheckout()
+                checkoutClientTestsRepository()
+
+                def promoteStatus = sh(
+                    returnStatus: true,
+                    script: '''
+                        set -e
+                        if [ ! -f "client-tests/package.json" ]; then
+                            echo "ERROR: client-tests/package.json not found — IMPORTED repo must be a Playwright project"
+                            exit 1
+                        fi
+                        # Remove anything left at workspace root except the customer clone
+                        find . -mindepth 1 -maxdepth 1 ! -name client-tests -exec rm -rf {} +
+                        # Promote customer project files to workspace root (including dotfiles)
+                        bash -c 'shopt -s dotglob nullglob; mv client-tests/* .'
+                        rmdir client-tests 2>/dev/null || rm -rf client-tests
+                        test -f package.json
+                    '''
+                )
+                if (promoteStatus != 0) {
+                    writeExecutionResult('FAILED', 'Checkout', 'INVALID_IMPORT_PROJECT', 'IMPORTED customer repository is missing package.json or could not be prepared as the Playwright project root')
+                    error('IMPORTED customer repository is missing package.json or could not be prepared as the Playwright project root')
+                }
+                echo '✅ IMPORT customer Playwright project ready at workspace root'
+            }
+
+            // IMPORT flow: npm install only (Chrome install via ensureImportedPlaywrightChromeInstalled)
+            def installImportedDependencies() {
+                echo '📦 IMPORT Setup — npm install'
+                def npmStatus = timeout(time: 20, unit: 'MINUTES') {
+                    sh(
+                        script: '''
+                            set -e
+                            npm install --no-audit --no-fund
+                        ''',
+                        returnStatus: true
+                    )
+                }
+                if (npmStatus != 0) {
+                    writeExecutionResult('FAILED', 'Setup', 'SETUP_FAILED', "IMPORT npm install failed with exit code: ${npmStatus}")
+                    error("IMPORT npm install failed with exit code: ${npmStatus}")
+                }
+                echo '✅ IMPORT npm dependencies installed'
+            }
+
+            // IMPORT: accept backend suite_testcase as-is (no playwright --list / title discovery)
+            def prepareImportedExecutionPlanFromBackend() {
+                def filteredFile = env.FILTERED_SUITE_TESTCASE_FILE ?: '.pipeline-filtered-suite-testcase.json'
+                def filtered = readPipelineJsonMap(filteredFile)
+                def executed = []
+                filtered.each { suite, testcases ->
+                    toGroovyList(testcases).each { name ->
+                        if (name?.toString()?.trim() && name.toString().trim() != 'all') {
+                            executed.add(name.toString().trim())
+                        }
+                    }
+                }
+                writeJSON(file: '.pipeline-executed-testcases.json', json: executed)
+                writeJSON(file: '.pipeline-missing-testcases.json', json: [])
+                writeJSON(file: '.pipeline-missing-by-suite.json', json: [:])
+                env.EXECUTED_TESTCASES_FILE = '.pipeline-executed-testcases.json'
+                env.MISSING_TESTCASES_FILE = '.pipeline-missing-testcases.json'
+                env.PARTIAL_TESTCASES = (env.HAS_INVALID_SUITES == 'true') ? 'true' : 'false'
+                env.SKIP_PLAYWRIGHT = filtered ? 'false' : 'true'
+                echo "📋 IMPORT execution plan ready (suites=${filtered.size()}, testcases=${executed.size()}, partial=${env.PARTIAL_TESTCASES})"
+            }
+
+            // IMPORT flow: run customer project with BROWSER + ENV via cross-env (one Playwright run = one results/)
+            // On Playwright failure: still collect reports → ZIP → Upload stage → UNSTABLE (same as Recorder/Upload)
+            def runImportedSuiteTestcases() {
+                echo '🧪 IMPORT Execute — customer Playwright project (direct backend suite/testcase)'
+                def suiteTestcase = parseSuiteTestcase()
+                def filteredFile = env.FILTERED_SUITE_TESTCASE_FILE ?: '.pipeline-filtered-suite-testcase.json'
+                if (fileExists(filteredFile)) {
+                    def filtered = readJSON(file: filteredFile)
+                    if (filtered instanceof Map && !filtered.isEmpty()) {
+                        suiteTestcase = filtered
+                        echo '🧪 IMPORT using filtered suite/testcase map (invalid suites/testcases excluded)'
+                    }
+                }
+
+                def suiteNames = toGroovyList(suiteTestcase.keySet())
+                echo "🧪 IMPORT running suites: ${suiteNames.join(', ')}"
+
+                def datetime = sh(script: "date +'%Y%m%d_%H%M%S'", returnStdout: true).trim()
+                def label = suiteNames.size() == 1 ? suiteNames[0] : suiteNames.join('-')
+                def suiteDir = "${label}_${datetime}"
+                def zipName = "${label}_${datetime}.zip"
+                env.SUITE_DIR = suiteDir
+                env.ZIP_NAME = zipName
+
+                def browser = toPlainString(params.browser)
+                def environment = toPlainString(params.environment)
+
+                // Build one Playwright invocation with exact discovered spec files (not whole suite dirs)
+                // so a global -g cannot pick up same-titled tests from unrelated specs in other suites.
+                def testPaths = []
+                def grepTitles = []
+                def anyAll = false
+                def anyTitle = false
+                suiteTestcase.each { suite, testcases ->
+                    def suitePath = tryResolveSuitePath(suite as String)
+                    if (!suitePath) {
+                        echo "⚠️ IMPORT suite path not resolvable for '${suite}' — skipping"
+                        return
+                    }
+                    def tcList = toGroovyList(testcases).findAll { it?.toString()?.trim() }.collect { it.toString().trim() }
+                    if (tcList.contains('all')) {
+                        anyAll = true
+                        testPaths.add(suitePath)
+                        echo "🧪 IMPORT suite '${suite}' mode=all → ${suitePath}"
+                    } else if (tcList) {
+                        anyTitle = true
+                        def specs = resolveSpecFilesForSuiteTestcases(suitePath, tcList)
+                        if (!specs) {
+                            echo "⚠️ IMPORT suite '${suite}': no spec files resolved for titles ${tcList} — skipping"
+                            return
+                        }
+                        specs.each { p ->
+                            if (!testPaths.contains(p)) {
+                                testPaths.add(p)
+                            }
+                        }
+                        tcList.each { t ->
+                            if (!grepTitles.contains(t)) {
+                                grepTitles.add(t)
+                            }
+                        }
+                        echo "🧪 IMPORT suite '${suite}' titles=${tcList} → specs=${specs}"
+                    }
+                }
+
+                if (!testPaths) {
+                    echo '⚠️ IMPORT: no resolvable suite/spec paths — skipping Playwright'
+                    env.TEST_EXIT_CODE = '1'
+                    try {
+                        writeFinalValidationExecutionResult(1, true)
+                    } catch (Exception e) {
+                        echo "⚠️ IMPORT writeFinalValidationExecutionResult failed (continuing): ${e.message}"
+                    }
+                    return
+                }
+
+                def pathsArg = testPaths.collect { "'${it}'" }.join(' ')
+                // Title-only runs: -g on exact files. If any suite is "all", omit -g so suite-dir paths are not filtered.
+                def grepArg = ''
+                if (anyTitle && !anyAll && grepTitles) {
+                    def escaped = grepTitles.collect { escapePlaywrightGrepLiteral(it) }
+                    def testcasePattern = escaped.join('|')
+                    def safeGrep = testcasePattern.replace('"', '\\"')
+                    grepArg = "-g \"${safeGrep}\""
+                }
+
+                echo "🧪 IMPORT: npx cross-env BROWSER=${browser} ENV=${environment} playwright test ${pathsArg} ${grepArg}"
+
+                def logPid = startPeriodicLogging()
+                def overallExitCode = 1
+                try {
+                    overallExitCode = timeout(time: 90, unit: 'MINUTES') {
+                        sh(
+                            script: """
+                                set +e
+                                timeout 5400 \\
+                                    npx cross-env \\
+                                    BROWSER="${browser}" \\
+                                    ENV="${environment}" \\
+                                    playwright test \\
+                                    ${pathsArg} \\
+                                    ${grepArg}
+                                EXIT_CODE=\$?
+                                exit \$EXIT_CODE
+                            """,
+                            returnStatus: true
+                        )
+                    }
+                } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                    echo "⚠️ IMPORT test execution timed out: ${e.message}"
+                    overallExitCode = 1
+                } catch (Exception e) {
+                    echo "⚠️ IMPORT test execution error: ${e.message}"
+                    overallExitCode = 1
+                } finally {
+                    stopPeriodicLogging(logPid)
+                }
+
+                echo "📟 IMPORT Playwright exit code: ${overallExitCode}"
+
+                // TEMP DEBUG ONLY — after Playwright, before packaging (IMPORT)
+                sh """
+                    set +e
+                    echo "===== IMPORT TEMP DIAGNOSTICS START ====="
+                    echo "Executed command was:"
+                    echo "npx cross-env BROWSER=${browser} ENV=${environment} playwright test ${pathsArg} ${grepArg}"
+                    echo "Exit code: ${overallExitCode}"
+
+                    pwd
+
+                    echo "===== CUSTOMER PLAYWRIGHT CONFIG ====="
+                    ls -la playwright.config.* 2>/dev/null || echo "(no playwright.config.* at workspace root)"
+                    for f in playwright.config.ts playwright.config.js playwright.config.mjs; do
+                      if [ -f "\$f" ]; then
+                        echo "----- \$f -----"
+                        sed -n '1,200p' "\$f"
+                      fi
+                    done
+                    echo "----- reporter/outputFolder grep -----"
+                    grep -n -E "reporter|outputFolder|outputFile|results|test-results|html" playwright.config.* 2>/dev/null || true
+
+                    echo "===== ALL DIRECTORIES ====="
+                    find . -maxdepth 5 -type d -print 2>/dev/null | sort
+
+                    echo "===== ALL JSON FILES ====="
+                    find . -maxdepth 7 -type f -name "*.json" -print 2>/dev/null | sort
+
+                    echo "===== RESULT FILES ====="
+                    find . -maxdepth 7 -type f \\( \\
+                      -name "result.json" -o \\
+                      -name "results.json" -o \\
+                      -name "junit.xml" \\
+                    \\) -print 2>/dev/null | sort
+
+                    echo "===== PLAYWRIGHT ARTIFACTS ====="
+                    find . -maxdepth 8 -type f \\( \\
+                      -name "*.png" -o \\
+                      -name "*.jpg" -o \\
+                      -name "*.webm" -o \\
+                      -name "*.mp4" -o \\
+                      -name "trace.zip" \\
+                    \\) -print 2>/dev/null | sort
+
+                    echo "===== PLAYWRIGHT DIRECTORIES ====="
+                    find . -maxdepth 5 -type d \\( \\
+                      -name "results" -o \\
+                      -name "test-results" -o \\
+                      -name "playwright-report" -o \\
+                      -name "reports" \\
+                    \\) -print 2>/dev/null | sort
+
+                    echo "===== IMPORT TEMP DIAGNOSTICS END ====="
+                """
+
+                suiteNames.each { suite ->
+                    try {
+                        createTestStatus(suite as String, overallExitCode as Integer)
+                    } catch (Exception e) {
+                        echo "⚠️ IMPORT createTestStatus failed for '${suite}' (continuing): ${e.message}"
+                    }
+                }
+
+                echo "IMPORT test exit code: ${overallExitCode}"
+                env.TEST_EXIT_CODE = "${overallExitCode}"
+
+                try {
+                    writeFinalValidationExecutionResult(overallExitCode as Integer, true)
+                } catch (Exception e) {
+                    echo "⚠️ IMPORT writeFinalValidationExecutionResult failed (continuing): ${e.message}"
+                }
+
+                try {
+                    packageImportedPlaywrightResults(suiteDir, zipName)
+                    addPendingUploadZip(zipName)
+                } catch (Exception e) {
+                    echo "⚠️ IMPORT packageImportedPlaywrightResults failed: ${e.message}"
+                    writeExecutionResult('FAILED', 'Execute Tests', 'ZIP_CREATION_FAILED', "Zip packaging failed: ${e.message}")
+                    try {
+                        ensureMinimalMetadata()
+                        sh """
+                            set +e
+                            echo "📦 IMPORT fallback packaging: ${zipName}"
+                            mkdir -p "${suiteDir}/results"
+                            cp "${env.METADATA_FILE}" "${suiteDir}/" 2>/dev/null || true
+                            if [ -f "results/result.json" ] && [ -d "results" ]; then
+                                rm -rf "${suiteDir}/results"
+                                cp -a results "${suiteDir}/results"
+                            elif [ -f "reports/default/results.json" ]; then
+                                cp "reports/default/results.json" "${suiteDir}/results/result.json"
+                                [ -d "reports/default/artifacts" ] && cp -a "reports/default/artifacts" "${suiteDir}/results/artifacts"
+                                [ -d "test-results" ] && [ ! -d "${suiteDir}/results/artifacts" ] && cp -a "test-results" "${suiteDir}/results/artifacts"
+                                [ -d "reports/default/html-report" ] && cp -a "reports/default/html-report" "${suiteDir}/results/html-report"
+                                [ -d "playwright-report" ] && [ ! -d "${suiteDir}/results/html-report" ] && cp -a "playwright-report" "${suiteDir}/results/html-report"
+                                [ -f "reports/default/junit.xml" ] && cp "reports/default/junit.xml" "${suiteDir}/results/junit.xml"
+                            fi
+                            zip -r -q -6 "${zipName}" "${suiteDir}"
+                            rm -rf "${suiteDir}"
+                            ls -lh "${zipName}" 2>/dev/null || true
+                        """
+                        if (fileExists(zipName)) {
+                            addPendingUploadZip(zipName)
+                            echo "✅ IMPORT fallback ZIP ready: ${zipName}"
+                        } else {
+                            echo "❌ IMPORT fallback ZIP was not created"
+                        }
+                    } catch (Exception e2) {
+                        echo "⚠️ IMPORT fallback packaging also failed: ${e2.message}"
+                    }
+                }
+
+                if (overallExitCode != 0) {
+                    echo '⚠️ IMPORT tests failed - marking build as UNSTABLE (artifacts preserved for S3 upload)'
+                    currentBuild.result = 'UNSTABLE'
+                } else if (env.PARTIAL_TESTCASES == 'true' || env.HAS_INVALID_SUITES == 'true') {
+                    echo '⚠️ IMPORT PARTIAL_FAILED — single execution ZIP uploaded (validation details in metadata.json)'
+                } else {
+                    echo '✅ IMPORT tests passed'
+                }
+            }
+
+            // Decrypt a single AES-256-CBC (pbkdf2) Base64 value using the Jenkins-held encryption key.
+            // Key comes only from the 'aws-encryption-key' Secret Text credential, never a parameter.
+            // Writes ciphertext to a temp file, decrypts, returns plaintext, and always removes temp files.
+            def decryptValue(String encryptedValue, String stage = 'Checkout') {
+                if (!encryptedValue?.trim()) {
+                    def code = (stage == 'Upload to S3') ? 'UPLOAD_FAILED' : 'INVALID_CLIENT_PAT'
+                    def msg = (stage == 'Upload to S3')
+                        ? 'Invalid AWS credentials. Please verify the encrypted AWS access keys.'
+                        : 'Invalid GitHub Personal Access Token. Please verify the encrypted client_pat.'
+                    writeExecutionResult('FAILED', stage, code, msg)
+                    error(msg)
+                }
+
+                def encFile = ".dec-in-${UUID.randomUUID().toString()}"
+                def outFile = ".dec-out-${UUID.randomUUID().toString()}"
+                writeFile(file: encFile, text: encryptedValue.trim())
+
+                withCredentials([string(credentialsId: 'aws-encryption-key', variable: 'ENCRYPTION_KEY')]) {
+                    try {
+                        def status = withEnv(["DEC_IN=${encFile}", "DEC_OUT=${outFile}"]) {
+                            sh(
+                                label: 'Decrypt value',
+                                returnStatus: true,
+                                script: '''
+                                    set +x
+                                    openssl enc -d -aes-256-cbc -pbkdf2 -a -A -in "$DEC_IN" -out "$DEC_OUT" -pass env:ENCRYPTION_KEY
+                                '''
+                            )
+                        }
+                        if (status != 0) {
+                            def code = (stage == 'Upload to S3') ? 'UPLOAD_FAILED' : 'INVALID_CLIENT_PAT'
+                            def msg = (stage == 'Upload to S3')
+                                ? 'Invalid AWS credentials. Please verify the encrypted AWS access keys.'
+                                : 'Invalid GitHub Personal Access Token. Please verify the encrypted client_pat.'
+                            writeExecutionResult('FAILED', stage, code, msg)
+                            error(msg)
+                        }
+
+                        def plaintext = readFile(outFile).trim()
+                        if (!plaintext) {
+                            def code = (stage == 'Upload to S3') ? 'UPLOAD_FAILED' : 'INVALID_CLIENT_PAT'
+                            def msg = (stage == 'Upload to S3')
+                                ? 'Invalid AWS credentials. Please verify the encrypted AWS access keys.'
+                                : 'Invalid GitHub Personal Access Token. Please verify the encrypted client_pat.'
+                            writeExecutionResult('FAILED', stage, code, msg)
+                            error(msg)
+                        }
+                        return plaintext
+                    } finally {
+                        sh(label: 'Cleanup temp files', script: "rm -f '${encFile}' '${outFile}'")
+                    }
+                }
+            }
+
+            // Docker run args: Jenkins host UID:GID (avoid root-owned Playwright artifacts)
+            def dockerAgentRunArgs() {
+                def uid = sh(script: 'id -u', returnStdout: true).trim()
+                def gid = sh(script: 'id -g', returnStdout: true).trim()
+                def args = "-u ${uid}:${gid} --shm-size=2gb"
+                echo "🐳 Docker agent args: ${args}"
+                return args
+            }
+
+            // Force-delete root-owned artifacts, then restore workspace ownership to Jenkins user
+            def prepareWorkspaceForCheckout() {
+                sh '''
+                    set +e
+                    echo '🧹 Preparing workspace for checkout...'
+                    HOST_UID=$(id -u)
+                    HOST_GID=$(id -g)
+                    echo "   Restoring ownership to ${HOST_UID}:${HOST_GID}"
+
+                    if command -v docker >/dev/null 2>&1; then
+                        docker run --rm \
+                            -v "$(pwd):/ws" \
+                            -w /ws \
+                            --user root \
+                            alpine:3.19 \
+                            sh -c "
+                                set +e
+                                # Restore ownership first so Jenkins/Git can always write
+                                chown -R ${HOST_UID}:${HOST_GID} /ws
+                                chmod -R u+rwX /ws
+                                rm -rf /ws/node_modules /ws/test-results /ws/reports /ws/playwright-report /ws/blob-report /ws/client-tests /ws/tests /ws/.npm-install-hash
+                                rm -f /ws/clone_out.txt /ws/.dec-in-* /ws/.dec-out-*
+                                find /ws -maxdepth 1 -name '*.zip' -exec rm -f {} +
+                                chown -R ${HOST_UID}:${HOST_GID} /ws
+                                chmod -R u+rwX /ws
+                            " 2>/dev/null || \
+                        docker run --rm \
+                            -v "$(pwd):/ws" \
+                            -w /ws \
+                            --user root \
+                            alpine:3.19 \
+                            sh -c "
+                                set +e
+                                chown -R ${HOST_UID}:${HOST_GID} /ws
+                                chmod -R u+rwX /ws
+                                rm -rf /ws/node_modules /ws/test-results /ws/reports /ws/playwright-report /ws/blob-report /ws/client-tests /ws/tests /ws/.npm-install-hash
+                                rm -f /ws/clone_out.txt /ws/.dec-in-* /ws/.dec-out-*
+                                find /ws -maxdepth 1 -name '*.zip' -exec rm -f {} +
+                                chown -R ${HOST_UID}:${HOST_GID} /ws
+                                chmod -R u+rwX /ws
+                            " 2>/dev/null || true
+                    fi
+
+                    chmod -R u+w . 2>/dev/null || true
+                    rm -rf node_modules test-results reports playwright-report blob-report client-tests tests .npm-install-hash 2>/dev/null || true
+                    rm -f clone_out.txt .dec-in-* .dec-out-* 2>/dev/null || true
+                    find . -maxdepth 1 -name '*.zip' -exec rm -f {} + 2>/dev/null || true
+                    echo '✅ Workspace cleaned and ownership restored'
+                '''
+            }
+
+            def defaultGitCloneExtensions() {
+                return [
+                    [$class: 'CloneOption', depth: 1, shallow: true, noTags: true, timeout: 10]
+                ]
+            }
+
+            def checkoutFrameworkRepository() {
+                try {
+                    checkout buildFrameworkGitScmConfig()
+                } catch (Exception e) {
+                    writeExecutionResult('FAILED', 'Checkout', 'FRAMEWORK_CHECKOUT_FAILED', "Framework repository checkout failed: ${e.message}")
+                    error("Framework repository checkout failed: ${e.message}")
+                }
+                echo '✅ Framework repository checked out at branch: poc'
+            }
+
+            def buildFrameworkGitScmConfig() {
+                return [
+                    $class: 'GitSCM',
+                    branches: [[name: '*/sample']],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: defaultGitCloneExtensions(),
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/Ideas2IT/taas-playwright-framework.git',
+                        credentialsId: 'framework-crds'
+                    ]]
+                ]
+            }
+
+            def checkoutClientTestsRepository() {
+                def clientUrl = params.client_repo_url?.trim()
+                if (!clientUrl) {
+                    writeExecutionResult('FAILED', 'Checkout', 'INVALID_REPOSITORY_URL', 'Unable to access the client repository. Verify the repository URL.')
+                    error('Unable to access the client repository. Verify the repository URL.')
+                }
+                if (!params.client_username?.trim()) {
+                    writeExecutionResult('FAILED', 'Checkout', 'INVALID_REPOSITORY_CREDENTIALS', 'Invalid GitHub username or Personal Access Token.')
+                    error('Invalid GitHub username or Personal Access Token.')
+                }
+                String gitPassword = decryptValue(params.client_pat)
+                if (!gitPassword) {
+                    writeExecutionResult('FAILED', 'Checkout', 'INVALID_CLIENT_PAT', 'Invalid GitHub Personal Access Token. Please verify the encrypted client_pat.')
+                    error('Invalid GitHub Personal Access Token. Please verify the encrypted client_pat.')
+                }
+
+                def clientBranch = params.client_branch?.trim()
+                if (!clientBranch) {
+                    writeExecutionResult('FAILED', 'Checkout', 'BRANCH_NOT_FOUND', 'Specified branch was not found in the client repository.')
+                    error('Specified branch was not found in the client repository.')
+                }
+                def clientTestsDir = 'client-tests'
+
+                sh "rm -rf ${clientTestsDir}"
+
+                def repoHostPath = clientUrl.replaceFirst('(?i)^https://', '')
+                def safeBranch = clientBranch.replace("'", "'\\''")
+                def safeHostPath = repoHostPath.replace("'", "'\\''")
+                def authUser = repoHostPath.toLowerCase().startsWith('github.com/')
+                    ? 'x-access-token'
+                    : params.client_username.trim().replace("'", "'\\''")
+
+                withEnv(["CLIENT_GIT_PASSWORD=${gitPassword}"]) {
+                    // Remove any leftover root-owned clone_out.txt before capturing output
+                    sh '''
+                        set +e
+                        if command -v docker >/dev/null 2>&1; then
+                            docker run --rm \
+                                -v "$(pwd):/ws" \
+                                -w /ws \
+                                --user root \
+                                alpine:3.19 \
+                                sh -c 'rm -f /ws/clone_out.txt' \
+                                2>/dev/null || true
+                        fi
+                        rm -f clone_out.txt 2>/dev/null || true
+                    '''
+
+                    def cloneOutput = sh(
+                        label: 'Clone client repository',
+                        returnStdout: true,
+                        script: """
+                            set +e
+                            set +x
+                            git clone --depth 1 --no-tags --branch '${safeBranch}' \\
+                                "https://${authUser}:\${CLIENT_GIT_PASSWORD}@${safeHostPath}" client-tests 2>&1
+                            printf '\\n__CLONE_EXIT__=%s\\n' "\$?"
+                        """
+                    ).trim()
+
+                    def cloneStatus = 1
+                    def cloneLines = cloneOutput.readLines()
+                    def exitLine = cloneLines.reverse().find { it.startsWith('__CLONE_EXIT__=') }
+                    if (exitLine) {
+                        cloneStatus = exitLine.substring('__CLONE_EXIT__='.length()).trim() as Integer
+                    }
+                    def cloneLog = cloneLines.findAll { !it.startsWith('__CLONE_EXIT__=') }.join('\n').trim()
+                    // Jenkins-owned file (never root) for existing error parsers
+                    writeFile(file: 'clone_out.txt', text: cloneLog ? (cloneLog + '\n') : '')
+                    sh 'chmod a+rw clone_out.txt 2>/dev/null || true'
+
+                    try {
+                        if (cloneStatus != 0) {
+                            def parsedLog = fileExists('clone_out.txt') ? readFile('clone_out.txt') : ''
+                            def logLower = parsedLog.toLowerCase()
+                            def code = 'CLIENT_REPO_CLONE_FAILED'
+                            def msg = 'Failed to clone the client repository.'
+                            if (logLower.contains('remote branch') && logLower.contains('not found')) {
+                                code = 'BRANCH_NOT_FOUND'
+                                msg = 'Specified branch was not found in the client repository.'
+                            } else if (logLower.contains('authentication failed') || logLower.contains('invalid username') || logLower.contains('403') || logLower.contains('could not read username')) {
+                                code = 'INVALID_REPOSITORY_CREDENTIALS'
+                                msg = 'Invalid GitHub username or Personal Access Token.'
+                            } else if (logLower.contains('repository not found') || logLower.contains('404')) {
+                                code = 'INVALID_REPOSITORY_URL'
+                                msg = 'Unable to access the client repository. Verify the repository URL.'
+                            }
+                            writeExecutionResult('FAILED', 'Checkout', code, msg)
+                            error(msg)
+                        }
+                    } finally {
+                        sh '''
+                            set +e
+                            if command -v docker >/dev/null 2>&1; then
+                                docker run --rm \
+                                    -v "$(pwd):/ws" \
+                                    -w /ws \
+                                    --user root \
+                                    alpine:3.19 \
+                                    sh -c 'rm -f /ws/clone_out.txt' \
+                                    2>/dev/null || true
+                            fi
+                            rm -f clone_out.txt 2>/dev/null || true
+                        '''
+                    }
+                }
+
+                echo "✅ Client repository checked out: ${clientUrl} @ ${clientBranch}"
+            }
+
+            def materializeTestsFromClientRepository() {
+                def status = sh(
+                    returnStatus: true,
+                    script: '''
+                    set -e
+
+                    if [ ! -d "client-tests/tests" ]; then
+                        echo "ERROR: client-tests/tests not found in client repository"
+                        exit 1
+                    fi
+
+                    if [ -d tests ] && command -v docker >/dev/null 2>&1; then
+                        docker run --rm \
+                            -v "$(pwd):/ws" \
+                            -w /ws \
+                            --user root \
+                            alpine:3.19 \
+                            sh -c 'rm -rf /ws/tests' \
+                            2>/dev/null || true
+                    fi
+
+                    chmod -R u+w tests 2>/dev/null || true
+                    rm -rf tests
+                    cp -a client-tests/tests ./tests
+                ''')
+                if (status != 0) {
+                    writeExecutionResult('FAILED', 'Checkout', 'TESTS_FOLDER_NOT_FOUND', 'client-tests/tests not found in client repository')
+                    error('client-tests/tests not found in client repository')
+                }
+
+                echo '✅ Copied client-tests/tests → tests/'
+            }
+
+            def validateTestsDirectory() {
+                def status = sh(
+                    script: '''
+                        set -e
+                        test -d tests
+                        test "$(find tests -mindepth 1 -print -quit | wc -l)" -gt 0
+                    ''',
+                    returnStatus: true
+                )
+
+                if (status != 0) {
+                    writeExecutionResult('FAILED', 'Checkout', 'TESTS_FOLDER_NOT_FOUND', 'tests/ directory is missing or empty after client repository checkout')
+                    error('tests/ directory is missing or empty after client repository checkout')
+                }
+
+                echo '✅ tests/ directory verified'
+            }
+
+            // New Requirement: parse suite_testcase JSON parameter
+            def parseSuiteTestcase() {
+                if (!params.suite_testcase?.trim()) {
+                    writeExecutionResult('FAILED', 'Validate Suite', 'INVALID_SUITE_JSON', 'suite_testcase is mandatory')
+                    error('suite_testcase is mandatory')
+                }
+                def parsed
+                try {
+                    parsed = readJSON text: params.suite_testcase.trim()
+                } catch (Exception e) {
+                    writeExecutionResult('FAILED', 'Validate Suite', 'INVALID_SUITE_JSON', "Invalid suite_testcase JSON: ${e.message}")
+                    error("Invalid suite_testcase JSON: ${e.message}")
+                }
+                if (!(parsed instanceof Map) || parsed.isEmpty()) {
+                    writeExecutionResult('FAILED', 'Validate Suite', 'INVALID_SUITE_JSON', 'suite_testcase must be a non-empty JSON object')
+                    error('suite_testcase must be a non-empty JSON object')
+                }
+                return parsed
+            }
+
+            // Recursively scan tests/ once and map suite folder name → actual directory path
+            def discoverSuitePaths() {
+                echo '🔍 Discovering suite directories under tests/...'
+                def output = sh(
+                    script: '''
+                        set -e
+                        find tests -type d ! -path tests ! -path '*/.*' 2>/dev/null | while IFS= read -r dir; do
+                            name=$(basename "$dir")
+                            printf '%s|%s\n' "$name" "$dir"
+                        done
+                    ''',
+                    returnStdout: true
+                ).trim()
+
+                def map = [:]
+                if (output) {
+                    output.split('\n').each { line ->
+                        if (!line?.trim()) {
+                            return
+                        }
+                        def separator = line.indexOf('|')
+                        if (separator < 0) {
+                            return
+                        }
+                        def name = line.substring(0, separator)
+                        def path = line.substring(separator + 1)
+                        if (map.containsKey(name)) {
+                            def existing = map[name]
+                            if (existing instanceof List) {
+                                existing.add(path)
+                            } else {
+                                map[name] = [existing, path]
+                            }
+                        } else {
+                            map[name] = path
+                        }
+                    }
+                }
+
+                echo "✅ Discovered ${map.size()} suite name(s): ${map.keySet().join(', ')}"
+                map.each { name, path ->
+                    def display = path instanceof List ? path.join(', ') : path
+                    echo "   ${name} → ${display}"
+                }
+                return map
+            }
+
+            def cacheSuitePathMap(Map suitePathMap) {
+                // writeJSON is Pipeline-approved; avoid groovy.json.JsonOutput (Script Security)
+                writeJSON(file: '.pipeline-suite-path-map.json', json: suitePathMap)
+                env.SUITE_PATH_MAP_FILE = '.pipeline-suite-path-map.json'
+            }
+
+            def getSuitePathMap() {
+                def mapFile = env.SUITE_PATH_MAP_FILE ?: '.pipeline-suite-path-map.json'
+                if (!fileExists(mapFile)) {
+                    writeExecutionResult('FAILED', 'Validate Suite', 'UNEXPECTED_ERROR', 'Suite path map not initialized — discovery must run before suite validation or execution')
+                    error('Suite path map not initialized — discovery must run before suite validation or execution')
+                }
+                return readJSON(file: mapFile)
+            }
+
+            def resolveSuitePath(String suite) {
+                def map = getSuitePathMap()
+                if (!map.containsKey(suite)) {
+                    writeExecutionResult('FAILED', 'Validate Suite', 'SUITE_NOT_FOUND', "Suite '${suite}' not found under tests/ (searched recursively)")
+                    error("Suite '${suite}' not found under tests/ (searched recursively)")
+                }
+                def path = map[suite]
+                if (path instanceof Collection) {
+                    def pathList = toGroovyList(path)
+                    if (pathList.size() > 1) {
+                        writeExecutionResult('FAILED', 'Validate Suite', 'SUITE_NOT_FOUND', "Ambiguous suite '${suite}': found at ${pathList.join(', ')}")
+                        error("Ambiguous suite '${suite}': found at ${pathList.join(', ')}")
+                    }
+                    return pathList[0] as String
+                }
+                return path as String
+            }
+
+            // Non-failing suite path lookup for collect-all validation (returns null if missing/ambiguous/absent on disk)
+            def tryResolveSuitePath(String suite) {
+                def map = getSuitePathMap()
+                if (!map.containsKey(suite)) {
+                    return null
+                }
+                def path = map[suite]
+                if (path instanceof Collection) {
+                    def pathList = toGroovyList(path)
+                    if (pathList.size() != 1) {
+                        echo "❌ Ambiguous suite '${suite}': found at ${pathList.join(', ')}"
+                        return null
+                    }
+                    path = pathList[0]
+                }
+                def suiteExists = sh(
+                    script: "test -d '${path}'",
+                    returnStatus: true
+                ) == 0
+                return suiteExists ? (path as String) : null
+            }
+
+            // Collect valid/failed suites without error() — filter to valid only; Case 4 deferred
+            def validateSuiteTestcase(Map suiteTestcase) {
+                // Reset pending upload list for this run
+                writeJSON(file: '.pipeline-upload-zips.json', json: [])
+                env.PENDING_UPLOAD_ZIPS_FILE = '.pipeline-upload-zips.json'
+
+                def validSuites = []
+                def failedSuites = []
+                def filtered = [:]
+
+                suiteTestcase.each { suite, testcases ->
+                    echo "Validating suite: ${suite}"
+                    if (!(testcases instanceof List) || testcases.isEmpty()) {
+                        failedSuites.add(suite)
+                        echo "❌ Suite '${suite}' has empty/invalid testcase list"
+                        return
+                    }
+                    def suiteDir = tryResolveSuitePath(suite)
+                    if (!suiteDir) {
+                        failedSuites.add(suite)
+                        echo "❌ Suite '${suite}' not found under tests/"
+                        return
+                    }
+                    validSuites.add(suite)
+                    filtered[suite] = toGroovyList(testcases)
+                    echo "✅ Suite '${suite}' validated at ${suiteDir}"
+                }
+
+                writeJSON(file: '.pipeline-valid-suites.json', json: validSuites)
+                writeJSON(file: '.pipeline-failed-suites.json', json: failedSuites)
+                writeJSON(file: '.pipeline-filtered-suite-testcase.json', json: filtered)
+                env.FILTERED_SUITE_TESTCASE_FILE = '.pipeline-filtered-suite-testcase.json'
+                env.HAS_INVALID_SUITES = failedSuites ? 'true' : 'false'
+
+                echo "📊 Suite validation: valid=${validSuites.size()}, failed=${failedSuites.size()}"
+                // Do NOT call error() — continue so all suites/testcases are collected
+            }
+
+            // Validate mixed testcase entries: .spec.ts filenames (file search) + titles (playwright --list)
+            def validateTestcaseFiles(Map suiteTestcase) {
+                def filteredFile = env.FILTERED_SUITE_TESTCASE_FILE ?: '.pipeline-filtered-suite-testcase.json'
+                def input = suiteTestcase
+                if (fileExists(filteredFile)) {
+                    def fromSuiteValidation = readJSON(file: filteredFile)
+                    if (fromSuiteValidation instanceof Map) {
+                        input = fromSuiteValidation
+                    }
+                }
+
+                def filtered = [:]
+                def executed = []
+                def missing = []
+                def missingBySuite = [:]
+
+                input.each { suite, testcases ->
+                    def suiteDir = tryResolveSuitePath(suite as String)
+                    if (!suiteDir) {
+                        echo "⚠️ Skipping testcase validation for suite '${suite}' — path not resolvable"
+                        return
+                    }
+                    echo "Validating testcases for suite: ${suite} (${suiteDir})"
+
+                    def tcList = toGroovyList(testcases)
+                    if (tcList.contains('all')) {
+                        filtered[suite] = tcList
+                        echo "Suite '${suite}' uses 'all' — skipping per-testcase validation"
+                        return
+                    }
+
+                    // Lazy --list only when at least one title entry is present
+                    def suiteTitles = null
+                    def existing = []
+                    def suiteMissing = []
+
+                    tcList.each { name ->
+                        if (!name?.trim()) {
+                            return
+                        }
+                        name = name.trim()
+
+                        if (name.endsWith('.spec.ts')) {
+                            // Filename mode — recursive find under suite; do NOT use --list
+                            def foundPath = findSpecFileInSuite(suiteDir, name)
+                            if (foundPath) {
+                                existing.add(name)
+                                executed.add(name)
+                                echo "✅ Spec file found: ${foundPath}"
+                            } else {
+                                suiteMissing.add(name)
+                                missing.add(name)
+                                echo "❌ Spec file not found under ${suiteDir}: ${name}"
+                            }
+                        } else {
+                            // Title mode — compare against playwright --list
+                            if (suiteTitles == null) {
+                                suiteTitles = listPlaywrightTestcases(suiteDir)
+                                echo "📋 Playwright --list discovered ${suiteTitles.size()} testcase(s) under ${suiteDir}"
+                                suiteTitles.each { t -> echo "   • ${t}" }
+                            }
+                            if (suiteTitles.contains(name)) {
+                                existing.add(name)
+                                executed.add(name)
+                                echo "✅ Title found: ${name}"
+                            } else {
+                                suiteMissing.add(name)
+                                missing.add(name)
+                                echo "❌ Title not found in suite '${suite}': ${name}"
+                            }
+                        }
+                    }
+                    if (suiteMissing) {
+                        missingBySuite[suite] = suiteMissing
+                    }
+                    if (existing) {
+                        filtered[suite] = existing
+                    }
+                }
+
+                writeJSON(file: '.pipeline-executed-testcases.json', json: executed)
+                writeJSON(file: '.pipeline-missing-testcases.json', json: missing)
+                writeJSON(file: '.pipeline-missing-by-suite.json', json: missingBySuite)
+                writeJSON(file: '.pipeline-filtered-suite-testcase.json', json: filtered)
+                env.EXECUTED_TESTCASES_FILE = '.pipeline-executed-testcases.json'
+                env.MISSING_TESTCASES_FILE = '.pipeline-missing-testcases.json'
+                env.FILTERED_SUITE_TESTCASE_FILE = '.pipeline-filtered-suite-testcase.json'
+
+                def failedSuites = readPipelineJsonList('.pipeline-failed-suites.json')
+                def hasExecutable = filtered && !filtered.isEmpty()
+                def hasInvalid = (failedSuites && !failedSuites.isEmpty()) || (missing && !missing.isEmpty())
+
+                if (!hasExecutable) {
+                    env.SKIP_PLAYWRIGHT = 'true'
+                    env.PARTIAL_TESTCASES = 'false'
+                    echo '❌ No valid suites/testcases remain — Playwright will be skipped'
+                } else if (hasInvalid) {
+                    env.SKIP_PLAYWRIGHT = 'false'
+                    env.PARTIAL_TESTCASES = 'true'
+                    echo "⚠️ Partial validation — will execute valid items only (suites failed=${failedSuites.size()}, missing=${missing.size()})"
+                } else {
+                    env.SKIP_PLAYWRIGHT = 'false'
+                    env.PARTIAL_TESTCASES = 'false'
+                    echo '✅ All requested suites/testcases validated'
+                }
+            }
+
+            // Recursive find of a .spec.ts basename under suiteDir (returns first match path or null)
+            def findSpecFileInSuite(String suiteDir, String fileName) {
+                def base = fileName.toString().trim()
+                if (base.contains('/')) {
+                    base = base.tokenize('/').last()
+                }
+                def safeBase = base.replace("'", "'\\''")
+                def safeDir = suiteDir.toString().replace("'", "'\\''")
+                def output = sh(
+                    script: "find '${safeDir}' -type f -name '${safeBase}' 2>/dev/null | head -n 1",
+                    returnStdout: true
+                ).trim()
+                return output ? output : null
+            }
+
+            // Escape literal testcase titles for Playwright --grep (JS RegExp)
+            def escapePlaywrightGrepLiteral(String input) {
+                def s = (input ?: '').toString()
+                ['\\', '.', '^', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '$'].each { c ->
+                    s = s.replace(c, '\\' + c)
+                }
+                return s
+            }
+
+            // IMPORT only: map testcase titles → spec file paths via playwright --list (no test execution)
+            def resolveSpecFilesForSuiteTestcases(String suiteDir, List testcaseTitles) {
+                def wanted = toGroovyList(testcaseTitles).findAll { it?.toString()?.trim() }.collect { it.toString().trim() }
+                if (!wanted || !suiteDir) {
+                    return []
+                }
+
+                def pwBin = fileExists('node_modules/.bin/playwright') ?
+                    './node_modules/.bin/playwright' : 'npx playwright'
+                def browser = toPlainString(params.browser)
+                def environment = toPlainString(params.environment)
+
+                echo "🔎 IMPORT resolving specs under ${suiteDir} for titles: ${wanted}"
+                def output = withEnv([
+                    "PLAYWRIGHT_BROWSERS_PATH=${env.PLAYWRIGHT_BROWSERS_PATH ?: '/ms-playwright'}",
+                    "BROWSER=${browser}",
+                    "ENV=${environment}"
+                ]) {
+                    sh(
+                        label: 'Playwright --list (IMPORT title→file)',
+                        returnStdout: true,
+                        script: """
+                            set +e
+                            npx cross-env \\
+                                BROWSER="${browser}" \\
+                                ENV="${environment}" \\
+                                ${pwBin} test '${suiteDir}' --list 2>&1
+                        """
+                    ).trim()
+                }
+
+                def titleToFiles = [:]
+                if (output) {
+                    output.split('\n').each { line ->
+                        def trimmed = line?.trim()
+                        if (!trimmed || !trimmed.contains('›')) {
+                            return
+                        }
+                        if (trimmed.startsWith('Listing') || trimmed.startsWith('Total:')) {
+                            return
+                        }
+                        def parts = trimmed.split('›')
+                        if (parts.length < 3) {
+                            return
+                        }
+                        def loc = parts[1]?.trim()
+                        if (!loc) {
+                            return
+                        }
+                        def filePath = loc.replaceAll(/:\d+:\d+\s*$/, '').trim()
+                        def leaf = parts[parts.length - 1]?.trim()
+                        if (!filePath || !leaf) {
+                            return
+                        }
+                        if (!titleToFiles.containsKey(leaf)) {
+                            titleToFiles[leaf] = []
+                        }
+                        if (!titleToFiles[leaf].contains(filePath)) {
+                            titleToFiles[leaf].add(filePath)
+                        }
+                    }
+                }
+
+                def resolved = []
+                wanted.each { title ->
+                    def files = titleToFiles[title]
+                    if (!files) {
+                        echo "⚠️ IMPORT: title '${title}' not found in --list under ${suiteDir}"
+                        return
+                    }
+                    files.each { f ->
+                        if (!resolved.contains(f)) {
+                            resolved.add(f)
+                        }
+                    }
+                }
+                echo "🔎 IMPORT resolved ${resolved.size()} spec file(s) under ${suiteDir}: ${resolved}"
+                return resolved
+            }
+
+            // Run `playwright test <suiteDir> --list` and return List of testcase titles (leaf names).
+            def listPlaywrightTestcases(String suiteDir) {
+                def pwBin = fileExists('node_modules/.bin/playwright') ?
+                    './node_modules/.bin/playwright' : 'npx playwright'
+                // Plain strings required — params.* wrappers in withEnv alone may not reach the Playwright process
+                def browser = toPlainString(params.browser)
+                def environment = toPlainString(params.environment)
+
+                echo "📋 Listing Playwright tests: BROWSER=${browser} ENV=${environment} ${pwBin} test ${suiteDir} --list"
+                def output = withEnv([
+                    "PLAYWRIGHT_BROWSERS_PATH=${env.PLAYWRIGHT_BROWSERS_PATH ?: '/ms-playwright'}",
+                    "BROWSER=${browser}",
+                    "ENV=${environment}"
+                ]) {
+                    sh(
+                        label: 'Playwright --list',
+                        returnStdout: true,
+                        script: """
+                            set +e
+                            npx cross-env \\
+                                BROWSER="${browser}" \\
+                                ENV="${environment}" \\
+                                ${pwBin} test '${suiteDir}' --list 2>&1
+                        """
+                    ).trim()
+                }
+
+                def titles = []
+                if (!output) {
+                    echo "⚠️ playwright --list returned empty output for ${suiteDir}"
+                    return titles
+                }
+
+                // Lines look like: [chromium] › path/to/file.spec.ts:10:5 › Parent › Sauce 3.1 description
+                output.split('\n').each { line ->
+                    def trimmed = line?.trim()
+                    if (!trimmed || !trimmed.contains('›')) {
+                        return
+                    }
+                    if (trimmed.startsWith('Listing') || trimmed.startsWith('Total:')) {
+                        return
+                    }
+                    def parts = trimmed.split('›')
+                    if (parts.length < 3) {
+                        return
+                    }
+                    def leaf = parts[parts.length - 1]?.trim()
+                    if (leaf && !titles.contains(leaf)) {
+                        titles.add(leaf)
+                    }
+                }
+
+                echo "📋 Parsed ${titles.size()} unique testcase title(s) from --list"
+                return titles
+            }
+
+            // List every *.spec.ts under a suite (used only for "all" mode file-path execution)
+            def listSuiteSpecFiles(String suiteDir) {
+                def output = sh(
+                    script: "find '${suiteDir}' -type f -name '*.spec.ts' 2>/dev/null | sort",
+                    returnStdout: true
+                ).trim()
+                if (!output) {
+                    return []
+                }
+                return toGroovyList(output.split('\n')).findAll { it?.trim() }
+            }
+
+            // Build execution plan for a suite:
+            // - "all" → all .spec.ts paths
+            // - .spec.ts names → resolved file paths (direct run, no grep)
+            // - titles → suiteDir + --grep "T1|T2"
+            // - mixed → both filePaths and titleGrep (runSuiteTestcases runs both)
+            def buildPlaywrightTestPaths(String suite, List testcases) {
+                def suiteDir = resolveSuitePath(suite)
+                if (testcases.contains('all')) {
+                    def allSpecs = listSuiteSpecFiles(suiteDir)
+                    if (!allSpecs) {
+                        writeExecutionResult('FAILED', 'Execute Tests', 'TESTCASE_NOT_FOUND', "No .spec.ts files found under ${suiteDir}")
+                        error("No .spec.ts files found under ${suiteDir}")
+                    }
+                    return [suiteDir: suiteDir, filePaths: allSpecs, titleGrep: '', skip: false]
+                }
+
+                def names = toGroovyList(testcases).findAll { it?.trim() }.collect { it.trim() }
+                if (!names) {
+                    echo "⏭️ Suite '${suite}' — no testcases to run"
+                    return [suiteDir: suiteDir, filePaths: [], titleGrep: '', skip: true]
+                }
+
+                def filePaths = []
+                def titles = []
+                names.each { name ->
+                    if (name.endsWith('.spec.ts')) {
+                        def found = findSpecFileInSuite(suiteDir, name)
+                        if (found) {
+                            filePaths.add(found)
+                            echo "✅ Execute file: ${found}"
+                        } else {
+                            echo "⚠️ Spec missing at execute time (skipped): ${name}"
+                        }
+                    } else {
+                        titles.add(name)
+                        echo "✅ Execute title: ${name}"
+                    }
+                }
+
+                def titleGrep = titles ? titles.join('|') : ''
+                if (!filePaths && !titleGrep) {
+                    return [suiteDir: suiteDir, filePaths: [], titleGrep: '', skip: true]
+                }
+
+                echo "🔎 Plan suite='${suite}' files=${filePaths.size()} titles=${titles.size()} grep=\"${titleGrep}\""
+                return [suiteDir: suiteDir, filePaths: filePaths, titleGrep: titleGrep, skip: false]
+            }
+
+            def ensureDockerAgentImage() {
+                // Kept for compatibility — ensures DOCKER_AGENT_IMAGE locally (use or build; never pull custom)
+                ensurePlaywrightDockerImagePulled(getDockerAgentImage())
+            }
+
+            def cleanWorkspace() {
+                prepareWorkspaceForCheckout()
+                cleanWs(
+                    deleteDirs: true,
+                    disableDeferredWipeout: true,
+                    notFailBuild: true
+                )
+            }
+
+            def startPeriodicLogging() {
+                def logPid = sh(
+                    script: '''
+                        (
+                            while true; do
+                                sleep 60
+                                echo "⏳ [$(date +%H:%M:%S)] Tests still running... (This message appears every 60 seconds)"
+                                if pgrep -f "playwright" > /dev/null 2>&1; then
+                                    echo "   ✓ Playwright processes detected"
+                                else
+                                    echo "   ⚠️ No Playwright processes found"
+                                fi
+                            done
+                        ) &
+                        echo $!
+                    ''',
+                    returnStdout: true
+                ).trim()
+                return logPid
+            }
+
+            def stopPeriodicLogging(String logPid) {
+                if (logPid && logPid.trim()) {
+                    sh "kill ${logPid.trim()} 2>/dev/null || true"
+                }
+            }
+
+            def installDependenciesOptimized() {
+                def hashFile = env.NPM_HASH_FILE
+
+                def currentHash = timeout(time: 1, unit: 'MINUTES') {
+                    sh(
+                        script: "md5sum package-lock.json 2>/dev/null | cut -d' ' -f1 || echo 'none'",
+                        returnStdout: true
+                    ).trim()
+                }
+
+                def needsInstall = true
+
+                if (fileExists(hashFile)) {
+                    def savedHash = readFile(hashFile).trim()
+                    if (savedHash == currentHash && fileExists('node_modules/@playwright')) {
+                        needsInstall = false
+                        echo "✅ Dependencies up to date (hash match: ${currentHash})"
+                    }
+                }
+
+                if (!needsInstall) {
+                    return
+                }
+
+                echo '📦 Installing npm dependencies (hash changed or first run)...'
+                def exitCode = timeout(time: 15, unit: 'MINUTES') {
+                    sh(
+                        script: '''
+                            if [ -f "package-lock.json" ]; then
+                                npm ci --prefer-offline --no-audit --no-fund --silent 2>&1 | tail -15
+                            else
+                                npm install --prefer-offline --no-audit --no-fund --silent 2>&1 | tail -15
+                            fi
+                        ''',
+                        returnStatus: true
+                    )
+                }
+
+                if (exitCode != 0) {
+                    writeExecutionResult('FAILED', 'Setup', 'SETUP_FAILED', "NPM installation failed with exit code: ${exitCode}")
+                    error("NPM installation failed with exit code: ${exitCode}")
+                }
+
+                writeFile(file: hashFile, text: currentHash)
+                echo '✅ Dependencies installed successfully (hash saved)'
+            }
+
+            def createMetadata() {
+                echo '📝 Creating metadata...'
+                echo "   Build: ${env.BUILD_NUMBER}"
+                echo "   Job: ${env.JOB_NAME}"
+
+                // New Requirement: include suite_testcase JSON in metadata
+                def metadataContent = [
+                    tenantId: toPlainString(params.tenantId ?: 'N/A'),
+                    applicationId: toPlainString(params.applicationId ?: 'N/A'),
+                    test_run_id: toPlainString(params.test_run_id ?: 'N/A'),
+                    test_execution_id: toPlainString(params.test_execution_id ?: 'N/A'),
+                    test_execution_request_id: toPlainString(params.test_execution_request_id ?: 'N/A'),
+                    testCaseRequestType: toPlainString(params.testCaseRequestType ?: 'N/A'),
+                    suite_testcase: toPlainJsonValue(readJSON(text: params.suite_testcase.trim())),
+                    browser: toPlainString(params.browser),
+                    environment: toPlainString(params.environment),
+                    s3_prefix: toPlainString(params.s3_prefix),
+                    jenkins_build_id: toPlainString(env.BUILD_ID),
+                    jenkins_build_number: toPlainString(env.BUILD_NUMBER),
+                    jenkins_job_name: toPlainString(env.JOB_NAME),
+                    jenkins_build_url: toPlainString(env.BUILD_URL)
+                ]
+                writeJSON file: env.METADATA_FILE, json: toPlainJsonValue(metadataContent), pretty: 4
+
+                // Verify file was created
+                if (!fileExists(env.METADATA_FILE)) {
+                    writeExecutionResult('FAILED', 'Create Metadata', 'METADATA_FAILED', "Failed to create metadata file: ${env.METADATA_FILE}")
+                    error("❌ Failed to create metadata file: ${env.METADATA_FILE}")
+                }
+                
+                echo "✅ Metadata file created: ${env.METADATA_FILE}"
+                sh "cat ${env.METADATA_FILE}"
+                sh "ls -lh ${env.METADATA_FILE}"
+                
+                // Stash the metadata
+                try {
+                    stash name: 'metadata', includes: env.METADATA_FILE
+                    echo "✅ Metadata stashed successfully as 'metadata'"
+                } catch (Exception e) {
+                    writeExecutionResult('FAILED', 'Create Metadata', 'METADATA_FAILED', "Failed to stash metadata: ${e.message}")
+                    error("❌ Failed to stash metadata: ${e.message}\nStack: ${e.stackTrace}")
+                }
+            }
+
+            // Clean Playwright output folders before the next suite so runs do not overwrite each other
+            def cleanPlaywrightOutputDirs() {
+                sh '''
+                    rm -rf test-results playwright-report
+                '''
+                echo '🧹 Cleared test-results/ and playwright-report/ for next suite'
+            }
+
+            // Group flat Playwright suite entries by first folder in "file" (e.g. SauceThree/TC-015.spec.ts → SauceThree)
+            def transformPlaywrightResultsJson() {
+                sh '''
+                    set -e
+                    if [ ! -f "test-results/results.json" ]; then
+                        echo "⚠️ No test-results/results.json to transform"
+                        exit 0
+                    fi
+                    node -e "
+        const fs = require('fs');
+        const resultsPath = 'test-results/results.json';
+        const report = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
+        const suites = Array.isArray(report.suites) ? report.suites : [];
+        const groups = new Map();
+
+        function groupKeyFromFile(file) {
+        if (!file) return 'unknown';
+        const slash = file.indexOf('/');
+        if (slash === -1) {
+            return file.replace(/\\.[^/.]+$/, '') || file;
+        }
+        return file.slice(0, slash);
+        }
+
+        for (const suite of suites) {
+        const key = groupKeyFromFile(suite.file || '');
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(Object.assign({}, suite, { title: suite.title || key }));
+        }
+
+        report.suites = Array.from(groups.entries()).map(([key, children]) => ({
+        title: key,
+        file: key,
+        suites: children,
+        }));
+
+        fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
+                    "
+                '''
+                echo '✅ Transformed results.json suite hierarchy'
+            }
+
+            // Preserve full suite report artifacts under reports/<suite>/ before the next suite runs
+            def preserveSuiteReportArtifacts(String suite) {
+                sh """
+                    set -e
+                    mkdir -p "reports/${suite}"
+
+                    if [ -f "test-results/results.json" ]; then
+                        cp "test-results/results.json" "reports/${suite}/results.json"
+                    else
+                        echo "⚠️ No results.json found for suite '${suite}'"
+                    fi
+
+                    if [ -d "test-results" ]; then
+                        rm -rf "reports/${suite}/test-results"
+                        cp -r test-results "reports/${suite}/test-results"
+                    fi
+
+                    if [ -d "playwright-report" ]; then
+                        rm -rf "reports/${suite}/html-report"
+                        cp -r playwright-report "reports/${suite}/html-report"
+                    fi
+                """
+                echo "✅ Preserved suite artifacts → reports/${suite}/"
+            }
+
+            // IMPORT only: build local-style results/ from customer Playwright output (reports/default/results.json)
+            def packageImportedPlaywrightResults(String suiteDir, String zipName) {
+                echo "📦 IMPORT packaging → results/ (+ metadata) from Playwright output"
+                try {
+                    sh """
+                        set -e
+                        echo "📁 Creating IMPORT package directory: ${suiteDir}"
+                        mkdir -p "${suiteDir}/results"
+
+                        echo "----- IMPORT packaging source probe -----"
+                        ls -la reports/default 2>/dev/null || echo "(no reports/default)"
+                        ls -la results 2>/dev/null || echo "(no results/)"
+                        ls -la test-results 2>/dev/null || echo "(no test-results/)"
+                        ls -la playwright-report 2>/dev/null || echo "(no playwright-report/)"
+
+                        if [ -f "results/result.json" ] && [ -d "results" ]; then
+                            echo "✅ Using existing local-style results/ as-is"
+                            rm -rf "${suiteDir}/results"
+                            cp -a results "${suiteDir}/results"
+                        elif [ -f "reports/default/results.json" ]; then
+                            echo "✅ Using reports/default/results.json as result source of truth"
+                            cp "reports/default/results.json" "${suiteDir}/results/result.json"
+
+                            if [ -d "reports/default/artifacts" ]; then
+                                cp -a "reports/default/artifacts" "${suiteDir}/results/artifacts"
+                            elif [ -d "test-results" ]; then
+                                cp -a "test-results" "${suiteDir}/results/artifacts"
+                            fi
+
+                            if [ -d "reports/default/html-report" ]; then
+                                cp -a "reports/default/html-report" "${suiteDir}/results/html-report"
+                            elif [ -d "playwright-report" ]; then
+                                cp -a "playwright-report" "${suiteDir}/results/html-report"
+                            elif [ -d "reports/default/html" ]; then
+                                cp -a "reports/default/html" "${suiteDir}/results/html-report"
+                            fi
+
+                            if [ -f "reports/default/junit.xml" ]; then
+                                cp "reports/default/junit.xml" "${suiteDir}/results/junit.xml"
+                            elif [ -f "junit.xml" ]; then
+                                cp "junit.xml" "${suiteDir}/results/junit.xml"
+                            else
+                                JUNIT=\$(find . -maxdepth 5 -type f -name "junit.xml" ! -path "./${suiteDir}/*" 2>/dev/null | head -n 1)
+                                if [ -n "\$JUNIT" ]; then
+                                    cp "\$JUNIT" "${suiteDir}/results/junit.xml"
+                                fi
+                            fi
+
+                            # Preserve any other generated files under reports/default (except results.json already mapped)
+                            for f in reports/default/*; do
+                                [ -e "\$f" ] || continue
+                                base=\$(basename "\$f")
+                                case "\$base" in
+                                    results.json|artifacts|html-report|html|junit.xml) continue ;;
+                                esac
+                                if [ -d "\$f" ]; then
+                                    cp -a "\$f" "${suiteDir}/results/\$base"
+                                elif [ -f "\$f" ]; then
+                                    cp "\$f" "${suiteDir}/results/\$base"
+                                fi
+                            done
+                        else
+                            echo "ERROR: No results/result.json and no reports/default/results.json"
+                            find . -type f \\( -name "result.json" -o -name "results.json" \\) -print 2>/dev/null | head -50 || true
+                            exit 1
+                        fi
+
+                        if [ ! -f "${suiteDir}/results/result.json" ]; then
+                            echo "ERROR: ${suiteDir}/results/result.json missing after packaging assemble"
+                            exit 1
+                        fi
+
+                        cp "${env.METADATA_FILE}" "${suiteDir}/" 2>/dev/null || true
+
+                        echo "----- ZIP contents preview -----"
+                        find "${suiteDir}" -maxdepth 4 -print 2>/dev/null || true
+
+                        zip -r -q -6 "${zipName}" "${suiteDir}"
+                        if [ ! -f "${zipName}" ]; then
+                            echo "❌ Failed to create zip: ${zipName}"
+                            exit 1
+                        fi
+                        echo "✅ IMPORT zip created: ${zipName}"
+                        ls -lh "${zipName}"
+                        rm -rf "${suiteDir}"
+                    """
+                } catch (Exception e) {
+                    writeExecutionResult('FAILED', 'Execute Tests', 'ZIP_CREATION_FAILED', "Zip packaging failed: ${e.message}")
+                    error("Zip packaging failed: ${e.message}")
+                }
+            }
+
+            // New Requirement: execute all suites from suite_testcase JSON sequentially; single ZIP upload
+            def runSuiteTestcases() {
+                // Prefer filtered map from validation (invalid suites/specs excluded)
+                def suiteTestcase = parseSuiteTestcase()
+                def filteredFile = env.FILTERED_SUITE_TESTCASE_FILE ?: '.pipeline-filtered-suite-testcase.json'
+                if (fileExists(filteredFile)) {
+                    def filtered = readJSON(file: filteredFile)
+                    if (filtered instanceof Map && !filtered.isEmpty()) {
+                        suiteTestcase = filtered
+                        echo "🧪 Using filtered suite_testcase (invalid suites/specs excluded)"
+                    }
+                }
+                // keySet from JSONObject is not always a plain List — copy before join()
+                def suiteNames = toGroovyList(suiteTestcase.keySet())
+                echo "🧪 Running suites: ${suiteNames.join(', ')}"
+
+                withCredentials([
+                    string(credentialsId: 'PASSWORD', variable: 'PASSWORD'),
+                    string(credentialsId: 'BASE_URL', variable: 'BASE_URL'),
+                    string(credentialsId: 'USER_NAME', variable: 'USER_NAME')
+                ]) {
+                    def datetime = sh(script: "date +'%Y%m%d_%H%M%S'",  returnStdout: true).trim()
+                    def label = suiteNames.size() == 1 ? suiteNames[0] : suiteNames.join('-')
+                    def suiteDir = "${label}_${datetime}"
+                    def zipName = "${label}_${datetime}.zip"
+
+                    env.SUITE_DIR = suiteDir
+                    env.ZIP_NAME = zipName
+
+                    def overallExitCode = 0
+                    def isFirstSuite = true
+                    for (def suite : suiteTestcase.keySet()) {
+                        if (!isFirstSuite) {
+                            // Remove previous suite Playwright output before the next run
+                            cleanPlaywrightOutputDirs()
+                        }
+                        isFirstSuite = false
+
+                        def testcases = suiteTestcase[suite]
+                        echo "🧪 Running suite: ${suite}"
+                        def plan = buildPlaywrightTestPaths(suite, testcases as List)
+                        def exitCode = 0
+
+                        if (plan.skip) {
+                            exitCode = runPlaywrightTests(suite, [paths: [], grep: '', skip: true], PASSWORD, BASE_URL, USER_NAME)
+                        } else {
+                            def filePaths = toGroovyList(plan.filePaths)
+                            def titleGrep = (plan.titleGrep ?: '').toString()
+                            def suitePath = (plan.suiteDir ?: resolveSuitePath(suite)).toString()
+                            def ranOnce = false
+
+                            // 1) Filename mode — direct spec file paths, no --grep
+                            if (filePaths) {
+                                echo "🧪 Suite '${suite}' — running ${filePaths.size()} spec file(s)"
+                                def fileExit = runPlaywrightTests(suite, [paths: filePaths, grep: ''], PASSWORD, BASE_URL, USER_NAME)
+                                if (fileExit != 0) {
+                                    exitCode = fileExit
+                                }
+                                ranOnce = true
+                                // Snapshot file-run artifacts when a title run will follow (mixed)
+                                if (titleGrep) {
+                                    sh """
+                                        set +e
+                                        mkdir -p "reports/${suite}/_run_files"
+                                        [ -f test-results/results.json ] && cp test-results/results.json "reports/${suite}/_run_files/results.json"
+                                        [ -d test-results ] && rm -rf "reports/${suite}/_run_files/test-results" && cp -r test-results "reports/${suite}/_run_files/test-results"
+                                        [ -d playwright-report ] && rm -rf "reports/${suite}/_run_files/html-report" && cp -r playwright-report "reports/${suite}/_run_files/html-report"
+                                    """
+                                    cleanPlaywrightOutputDirs()
+                                }
+                            }
+
+                            // 2) Title mode — suite dir + --grep "T1|T2"
+                            if (titleGrep) {
+                                echo "🧪 Suite '${suite}' — running titles via --grep \"${titleGrep}\""
+                                def titleExit = runPlaywrightTests(suite, [paths: [suitePath], grep: titleGrep], PASSWORD, BASE_URL, USER_NAME)
+                                if (titleExit != 0) {
+                                    exitCode = titleExit
+                                }
+                                // Merge file-run + title-run results.json when mixed
+                                if (ranOnce && fileExists("reports/${suite}/_run_files/results.json")) {
+                                    sh """
+                                        set +e
+                                        mkdir -p test-results
+                                        if [ -f test-results/results.json ] && [ -f "reports/${suite}/_run_files/results.json" ]; then
+                                          node -e '
+                                            const fs = require("fs");
+                                            const a = JSON.parse(fs.readFileSync("reports/${suite}/_run_files/results.json", "utf8"));
+                                            const b = JSON.parse(fs.readFileSync("test-results/results.json", "utf8"));
+                                            const out = Object.assign({}, b);
+                                            out.suites = [].concat(a.suites || [], b.suites || []);
+                                            fs.writeFileSync("test-results/results.json", JSON.stringify(out, null, 2));
+                                          '
+                                        elif [ -f "reports/${suite}/_run_files/results.json" ]; then
+                                          cp "reports/${suite}/_run_files/results.json" test-results/results.json
+                                        fi
+                                    """
+                                }
+                            }
+                        }
+
+                        this.createTestStatus(suite, exitCode)
+                        // Restructure suites[] by folder, then snapshot artifacts for this suite
+                        transformPlaywrightResultsJson()
+                        preserveSuiteReportArtifacts(suite)
+                        if (exitCode != 0) {
+                            overallExitCode = exitCode
+                        }
+                    }
+
+                    echo "Test exit code: ${overallExitCode}"
+                    env.TEST_EXIT_CODE = "${overallExitCode}"
+
+                    // Final executionResult once BEFORE packaging so ZIPs include correct metadata
+                    writeFinalValidationExecutionResult(overallExitCode, true)
+
+                    // One execution ZIP only (PARTIAL_FAILED details live in metadata.json — no Failure_*.zip)
+                    packageResultsOptimized(suiteDir, zipName, suiteNames)
+                    addPendingUploadZip(zipName)
+
+                    if (overallExitCode != 0) {
+                        echo '⚠️ Tests failed - marking build as UNSTABLE'
+                        currentBuild.result = 'UNSTABLE'
+                    } else if (env.PARTIAL_TESTCASES == 'true' || env.HAS_INVALID_SUITES == 'true') {
+                        echo '⚠️ PARTIAL_FAILED — single execution ZIP uploaded (validation details in metadata.json)'
+                    }
+                }
+            }
+
+            // New Requirement: run Playwright with suite-dir + --grep (or file paths for "all")
+            def runPlaywrightTests(String suite, def testSpec, String password, String baseUrl, String userName) {
+                def playwrightProject = [
+                    chrome: 'chromium',
+                    chromium: 'chromium',
+                    firefox: 'firefox',
+                    webkit: 'webkit'
+                ].get(params.browser, params.browser)
+                def workersArg = params.workers ? "--workers=${params.workers}" : ''
+                def paths
+                def grepPattern = ''
+                def skipRun = false
+                if (testSpec instanceof Map) {
+                    paths = toGroovyList(testSpec.paths)
+                    grepPattern = (testSpec.grep ?: '').toString()
+                    skipRun = (testSpec.skip == true)
+                } else {
+                    paths = toGroovyList(testSpec)
+                }
+
+                // No extractable titles for this suite — keep packaging happy, do not fail the build
+                if (skipRun || !paths) {
+                    echo "⏭️ Skipping Playwright for suite '${suite}' (no runnable paths/titles)"
+                    sh '''
+                        mkdir -p test-results playwright-report
+                        echo '{"suites":[]}' > test-results/results.json
+                    '''
+                    return 0
+                }
+
+                def pathsArg = paths.join(' ')
+                def grepArg = ''
+                if (grepPattern) {
+                    def safeGrep = grepPattern.replace('\\', '\\\\').replace('"', '\\"')
+                    grepArg = "--grep \"${safeGrep}\""
+                }
+
+                def testExitCode = timeout(time: 90, unit: 'MINUTES') {
+                    withEnv([
+                        "PLAYWRIGHT_BROWSERS_PATH=${env.PLAYWRIGHT_BROWSERS_PATH ?: '/ms-playwright'}",
+                        "PASSWORD=${password}",
+                        "BASE_URL=${baseUrl}",
+                        "USER_NAME=${userName}",
+                        "SUITE=${suite}",
+                        "BROWSER=${params.browser}",
+                        "IS_REGRESSION=false"
+                    ]) {
+                        def logPid = startPeriodicLogging()
+
+                        def status = 1
+                        try {
+                            status = sh(
+                                script: """
+                                    set +e
+                                    timeout 5400 \\
+                                        ./node_modules/.bin/playwright test \\
+                                        ${pathsArg} \\
+                                        ${grepArg} \\
+                                        --project="${playwrightProject}" \\
+                                        ${workersArg}
+                                    EXIT_CODE=\$?
+                                    exit \$EXIT_CODE
+                                """,
+                                returnStatus: true
+                            )
+                        } catch (Exception e) {
+                            echo "⚠️ Test execution error: ${e.message}"
+                            status = 1
+                        } finally {
+                            stopPeriodicLogging(logPid)
+                        }
+
+                        sh '''
+                            echo "===== Checking Playwright Reports ====="
+                            find . -name "results.json" || true
+                            find . -name "*.json" || true
+                            ls -R test-results || true
+                            ls -R playwright-report || true
+                        '''
+
+                        return status
+                    }
+                }
+
+                return testExitCode
+            }
+
+            def createTestStatus(String suite, int exitCode) {
+                echo "🔍 Attempting to unstash metadata for ${suite}..."
+                echo "   Build: ${env.BUILD_NUMBER}"
+                echo "   Job: ${env.JOB_NAME}"
+                
+                // Check if metadata file already exists (might be from previous stage or parallel execution)
+                def metadataExists = fileExists(env.METADATA_FILE)
+                echo "   Metadata file exists before unstash: ${metadataExists}"
+                
+                if (!metadataExists) {
+                    try {
+                        echo "   Attempting to unstash metadata..."
+                        unstash 'metadata'
+                        echo "✅ Metadata unstashed successfully"
+                    } catch (Exception e) {
+                        echo "❌ CRITICAL: Failed to unstash metadata"
+                        echo "   Error: ${e.message}"
+                        echo "   Error class: ${e.class.name}"
+                        echo "   This indicates the 'Create Metadata' stage may have failed"
+                        echo "   or the stash 'metadata' does not exist or is corrupted"
+                        
+                        // Check if file exists now (maybe unstash partially worked)
+                        if (fileExists(env.METADATA_FILE)) {
+                            echo "   ⚠️ Metadata file exists despite unstash error - continuing"
+                        } else {
+                            writeExecutionResult('FAILED', 'Execute Tests', 'METADATA_FAILED', "Cannot proceed without metadata - metadata unstash failed: ${e.message}")
+                            error("❌ Cannot proceed without metadata - metadata unstash failed: ${e.message}")
+                        }
+                    }
+                } else {
+                    echo "✅ Metadata file already exists, skipping unstash"
+                }
+                
+                // Verify the file actually exists
+                if (!fileExists(env.METADATA_FILE)) {
+                    writeExecutionResult('FAILED', 'Execute Tests', 'METADATA_FAILED', "Metadata file ${env.METADATA_FILE} not found - cannot proceed")
+                    error("❌ Metadata file ${env.METADATA_FILE} not found - cannot proceed")
+                }
+                
+                echo "✅ Metadata file verified: ${env.METADATA_FILE}"
+                sh "cat ${env.METADATA_FILE}"
+
+                def statusFile = suite ? "test_status_${suite}.json" : 'test_status.json'
+
+                sh """
+                    cat > ${statusFile} <<'STATUS_EOF'
+            {
+                ${suite ? "\"suite\": \"${suite}\"," : ''}
+                "test_exit_code": ${exitCode},
+                "test_status": "${exitCode == 0 ? 'PASSED' : 'FAILED'}",
+                "tests_executed_at": "\$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            }
+            STATUS_EOF
+                """
+            }
+
+            def packageResultsOptimized(String suiteDir, String zipName, def suites) {
+                def suiteList = (suites instanceof List) ? suites : [suites]
+                echo "📦 Packaging results for ${suiteList.join(', ')}..."
+                echo "   Suite directory: ${suiteDir}"
+                echo "   Zip file name: ${zipName}"
+
+                // Copy each suite's preserved artifacts into its own folder inside the ZIP root
+                def suiteCopyCommands = suiteList.collect { suite ->
+                    """
+                    if [ -d "reports/${suite}" ]; then
+                        mkdir -p "${suiteDir}/${suite}"
+                        [ -f "reports/${suite}/results.json" ] && cp "reports/${suite}/results.json" "${suiteDir}/${suite}/results.json"
+                        [ -d "reports/${suite}/html-report" ] && cp -r "reports/${suite}/html-report" "${suiteDir}/${suite}/html-report"
+                        [ -d "reports/${suite}/test-results" ] && cp -r "reports/${suite}/test-results" "${suiteDir}/${suite}/test-results"
+                    fi"""
+                }.join('\n')
+
+                def suiteValidationChecks = suiteList.collect { suite ->
+                    "if [ -f \"${suiteDir}/${suite}/results.json\" ]; then found=1; fi"
+                }.join('\n            ')
+
+                try {
+                    sh """
+                        set -e
+
+                        echo "📁 Creating package directory: ${suiteDir}"
+                        mkdir -p "${suiteDir}"
+
+                        ${suiteCopyCommands}
+
+                        # Keep media only under test-results/; drop duplicate screenshots/videos from html-report/data/
+                        find "${suiteDir}" -type d -path '*/html-report/data' 2>/dev/null | while IFS= read -r datadir; do
+                            [ -z "\$datadir" ] && continue
+                            find "\$datadir" -type f \\( \\
+                                -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o \\
+                                -iname '*.gif' -o -iname '*.webp' -o -iname '*.webm' -o \\
+                                -iname '*.mp4' -o -iname '*.mov' \\
+                            \\) -delete 2>/dev/null || true
+                            echo "🧹 Removed duplicate media from \$datadir (kept under test-results/)"
+                        done
+
+                        found=0
+                        ${suiteValidationChecks}
+                        if [ "\$found" -eq 0 ]; then
+                            echo "ERROR: No suite results.json found under reports/"
+                            exit 1
+                        fi
+
+                        cp "${env.METADATA_FILE}" "${suiteDir}/" 2>/dev/null || true
+                        cp test_status*.json "${suiteDir}/" 2>/dev/null || true
+
+                        zip -r -q -6 "${zipName}" "${suiteDir}"
+
+                        echo "🔍 Verifying zip file creation..."
+                        if [ ! -f "${zipName}" ]; then
+                            echo "❌ Failed to create zip: ${zipName}"
+                            echo "📂 Current directory contents:"
+                            ls -lah
+                            echo "📂 Looking for zip files:"
+                            ls -lah *.zip 2>/dev/null || echo "No zip files found in current directory"
+                            exit 1
+                        fi
+
+                        echo "✅ Zip created successfully: ${zipName}"
+                        ls -lh "${zipName}"
+                        echo "📊 Zip file size: \$(du -h '${zipName}' | cut -f1)"
+
+                        rm -rf "${suiteDir}"
+                        echo "✅ Cleaned up temporary directory: ${suiteDir}"
+                    """
+                } catch (Exception e) {
+                    writeExecutionResult('FAILED', 'Execute Tests', 'ZIP_CREATION_FAILED', "Zip packaging failed: ${e.message}")
+                    error("Zip packaging failed: ${e.message}")
+                }
+            }
+
+            def uploadToS3Optimized(String zipFile) {
+                if (!zipFile || zipFile == 'N/A') {
+                    echo '❌ No zip file specified for upload'
+                    writeExecutionResult('FAILED', 'Upload to S3', 'UPLOAD_FAILED', 'No zip file specified for upload')
+                    error('No zip file specified for upload')
+                }
+
+                if (!fileExists(zipFile)) {
+                    echo "❌ Zip file not found: ${zipFile}"
+                    writeExecutionResult('FAILED', 'Upload to S3', 'UPLOAD_FAILED', "Zip file not found: ${zipFile}")
+                    error("Zip file not found: ${zipFile}")
+                }
+
+                echo "✅ Zip file found: ${zipFile}"
+
+                def prefix = (params.s3_prefix ?: '')
+                    .replaceAll('^/+', '')
+                    .replaceAll('/+$', '')
+
+                def s3Path = prefix ?
+                    "s3://taas-qa-ai/${prefix}/${zipFile}" :
+                    "s3://taas-qa-ai/${zipFile}"
+
+                String awsAccessKeyId = decryptValue(params.aws_access_key_id, 'Upload to S3')
+                String awsSecretAccessKey = decryptValue(params.aws_secret_access_key, 'Upload to S3')
+                String awsRegion = params.aws_region?.trim()
+                if (!awsRegion) {
+                    awsRegion = 'us-east-1'
+                }
+
+                if (!awsAccessKeyId) {
+                    writeExecutionResult('FAILED', 'Upload to S3', 'UPLOAD_FAILED', 'aws_access_key_id is mandatory')
+                    error('aws_access_key_id is mandatory')
+                }
+                if (!awsSecretAccessKey) {
+                    writeExecutionResult('FAILED', 'Upload to S3', 'UPLOAD_FAILED', 'aws_secret_access_key is mandatory')
+                    error('aws_secret_access_key is mandatory')
+                }
+
+                def credsFile = '.jenkins-aws-credentials'
+                writeFile(
+                    file: credsFile,
+                    text: '[default]\n' +
+                        'aws_access_key_id = ' + awsAccessKeyId + '\n' +
+                        'aws_secret_access_key = ' + awsSecretAccessKey + '\n'
+                )
+
+                try {
+                    withEnv([
+                        'AWS_SHARED_CREDENTIALS_FILE=' + env.WORKSPACE + '/' + credsFile,
+                        'AWS_DEFAULT_REGION=' + awsRegion
+                    ]) {
+                        echo "📤 Uploading to: ${s3Path}"
+
+                        try {
+                            retry(3) {
+                                sh(label: 'Upload to S3', script: """
+                                    set +x
+                                    aws configure list
+                                    aws s3 cp '${zipFile}' '${s3Path}' \\
+                                        --region '${awsRegion}' \\
+                                        --only-show-errors
+                                """)
+                            }
+
+                            echo "✅ Upload successful → ${s3Path}"
+                            env.ZIP_UPLOADED = 'true'
+
+                        } catch (Exception e) {
+                            writeExecutionResult('FAILED', 'Upload to S3', 'UPLOAD_FAILED', "Upload failed after retries: ${e.message}")
+                            error("Upload failed after retries: ${e.message}")
+                        }
+                    }
+                } finally {
+                    sh "rm -f '${credsFile}'"
+                }
+            }
+
+            def printSummary() {
+                def buildStatus = currentBuild.result ?: 'SUCCESS'
+                def testExitCode = env.TEST_EXIT_CODE ?: 'N/A'
+                def zipFile = env.ZIP_NAME ?: env.FINAL_ZIP_NAME ?: 'N/A'
+                def duration = currentBuild.durationString.replace(' and counting', '')
+
+                def testStatus = 'N/A'
+                if (testExitCode != 'N/A') {
+                    testStatus = (testExitCode == '0') ? '✅ PASSED' : '❌ FAILED'
+                }
+
+                def s3Location = 'N/A'
+                if (zipFile != 'N/A') {
+                    def prefix = params.s3_prefix ?: ''
+                    prefix = prefix.replaceAll('^/+', '/').replaceAll('/+$', '')
+                    s3Location = "s3://taas-qa-ai${prefix}/${zipFile}"
+                }
+
+                echo """
+            ╔════════════════════════════════════════════════════════════
+            ║ 📋 TaaS Execution Summary
+            ╠════════════════════════════════════════════════════════════
+            ║ Build Status:    ${buildStatus}
+            ║ Test Results:    ${testStatus}
+            ║ Duration:        ${duration}
+            ║
+            ║ Test Configuration:
+            ║ - Suites:        ${params.suite_testcase ?: 'N/A'}
+            ║ - Browser:       ${params.browser}
+            ║ - Environment:   ${params.environment}
+            ║ - Test Run ID:   ${params.test_run_id ?: 'N/A'}
+            ║
+            ║ 📦 Artifacts:
+            ║ - Zip File:      ${zipFile}
+            ║ - S3 Location:   ${s3Location}
+            ║
+            ║ 🔗 Build URL:     ${env.BUILD_URL}
+            ╚════════════════════════════════════════════════════════════
+            """
+            }   
