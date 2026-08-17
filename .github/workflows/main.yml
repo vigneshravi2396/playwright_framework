@@ -1,0 +1,2280 @@
+name: Playwright Test Execution Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      client_repo_url:
+        description: 'Client tests repository URL (e.g. https://github.com/company/client-tests.git)'
+        required: true
+        type: string
+        default: 'https://github.com/qadence-ai/boilerplate-qa.git'
+      client_branch:
+        description: 'Branch to checkout from the client tests repository'
+        required: true
+        type: string
+        default: 'vignesh_test_poc_new'
+      client_username:
+        description: 'Username for client repository checkout'
+        required: true
+        type: string
+        default: 'qadence-ideas2it'
+      client_pat:
+        description: 'AES-256-CBC encrypted GitHub PAT for client repository checkout'
+        required: true
+        type: string
+        default: ''
+      aws_access_key_id:
+        description: 'AES-256-CBC encrypted AWS access key ID for S3 upload'
+        required: true
+        type: string
+        default: ''
+      aws_secret_access_key:
+        description: 'AES-256-CBC encrypted AWS secret access key for S3 upload'
+        required: true
+        type: string
+        default: ''
+      suite_testcase:
+        description: 'JSON map of suite names to testcase files (use "all" for full suite)'
+        required: true
+        type: string
+        default: ''
+      browser:
+        description: 'Browser to run tests on'
+        required: true
+        type: choice
+        options:
+          - chrome
+          - firefox
+          - webkit
+          - chromium
+      environment:
+        description: 'Target environment for secrets'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+      s3_prefix:
+        description: 'Folder path inside the S3 bucket'
+        required: true
+        type: string
+        default: '/testing/results/upload/2026-06-17_07-43-21/staging'
+      aws_region:
+        description: 'AWS region for S3 upload'
+        required: false
+        type: string
+        default: 'us-east-1'
+      test_run_id:
+        description: 'Run ID for this execution'
+        required: false
+        type: string
+        default: ''
+      tenantId:
+        description: 'Tenant ID for this execution'
+        required: false
+        type: string
+        default: ''
+      applicationId:
+        description: 'App ID for this execution'
+        required: false
+        type: string
+        default: ''
+      test_execution_id:
+        description: 'Test Execution ID'
+        required: false
+        type: string
+        default: ''
+      test_execution_request_id:
+        description: 'Test Execution Request ID'
+        required: false
+        type: string
+        default: ''
+      testCaseRequestType:
+        description: 'Type of testcase request. Allowed values: RECORDED_OR_UPLOADED or IMPORTED'
+        required: false
+        type: string
+        default: ''
+      workers:
+        description: 'Number of parallel workers'
+        required: false
+        type: string
+        default: '4'
+
+# Single job mirrors Jenkins "Run Pipeline" sequential stages.
+# Docker agent / Ensure Docker Image have no GHA equivalent — ubuntu-latest + playwright install.
+jobs:
+  run-pipeline:
+    name: Run Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      CI: 'true'
+      METADATA_FILE: metadata.json
+      NPM_HASH_FILE: .npm-install-hash
+      PASSWORD: ${{ secrets.PASSWORD || vars.PASSWORD }}
+      BASE_URL: ${{ secrets.BASE_URL || vars.BASE_URL }}
+      USER_NAME: ${{ secrets.USER_NAME || vars.USER_NAME }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || vars.OPENAI_API_KEY }}
+      SELF_HEAL_ENABLED: ${{ vars.SELF_HEAL_ENABLED || 'false' }}
+      ALL_SCREENSHOT_ENABLED: ${{ vars.ALL_SCREENSHOT_ENABLED || 'false' }}
+      ENCRYPTION_KEY: ${{ secrets.AWS_ENCRYPTION_KEY || secrets.ENCRYPTION_KEY || secrets['aws-encryption-key'] }}
+
+    steps:
+      # 1–2. Checkout Framework, then Prepare Workspace (GHA needs checkout before clean)
+      - name: Checkout Framework Repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Workspace
+        run: |
+          set +e
+          echo "🧹 Cleaning workspace before pipeline execution..."
+          chmod -R u+w . 2>/dev/null || true
+          rm -rf node_modules test-results reports playwright-report blob-report client-tests tests .npm-install-hash 2>/dev/null || true
+          find . -maxdepth 1 -name '*.zip' -exec rm -f {} + 2>/dev/null || true
+          echo "✅ Workspace prepared"
+
+      # Shared helper: writeExecutionResult → metadata.json (Jenkins parity)
+      - name: Init executionResult helper
+        env:
+          TEST_CASE_REQUEST_TYPE_INPUT: ${{ github.event.inputs.testCaseRequestType }}
+        run: |
+          REQUEST_TYPE=$(printf '%s' "${TEST_CASE_REQUEST_TYPE_INPUT:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          echo "TEST_CASE_REQUEST_TYPE=${REQUEST_TYPE}" >> "$GITHUB_ENV"
+          echo "🔎 testCaseRequestType=${REQUEST_TYPE:-<empty → RECORDED_OR_UPLOADED>}"
+          cat > .pipeline-write-er.py <<'PY'
+          #!/usr/bin/env python3
+          import json, os, sys
+          from datetime import datetime, timezone
+
+          status = sys.argv[1] if len(sys.argv) > 1 else "FAILED"
+          stage = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
+          error_code = (sys.argv[3] if len(sys.argv) > 3 else "").strip()
+          message = sys.argv[4] if len(sys.argv) > 4 else ""
+
+          meta_path = os.environ.get("METADATA_FILE", "metadata.json")
+          run_url = (
+              f"{os.environ.get('GITHUB_SERVER_URL', '')}/"
+              f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/"
+              f"{os.environ.get('GITHUB_RUN_ID', '')}"
+          )
+          build_number = os.environ.get("GITHUB_RUN_NUMBER", "N/A")
+          timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          if os.path.isfile(meta_path):
+              with open(meta_path, encoding="utf-8") as f:
+                  metadata = json.load(f)
+              existing = metadata.get("executionResult") or {}
+              if status == "FAILED" and existing.get("status") == "FAILED":
+                  existing_code = str(existing.get("errorCode") or "")
+                  if error_code == "UNEXPECTED_ERROR" and existing_code and existing_code != "UNEXPECTED_ERROR":
+                      print(f"executionResult kept ({existing_code})")
+                      raise SystemExit(0)
+              existing_status = str(existing.get("status") or "")
+              if existing_status in ("PARTIAL_SUCCESS", "PARTIAL_FAILED") and error_code == "UNEXPECTED_ERROR":
+                  print(f"executionResult kept ({existing_status})")
+                  raise SystemExit(0)
+          else:
+              metadata = {
+                  "tenantId": os.environ.get("TENANT_ID") or "N/A",
+                  "applicationId": os.environ.get("APPLICATION_ID") or "N/A",
+                  "test_run_id": os.environ.get("TEST_RUN_ID") or "N/A",
+                  "test_execution_id": os.environ.get("TEST_EXECUTION_ID") or "N/A",
+                  "test_execution_request_id": os.environ.get("TEST_EXECUTION_REQUEST_ID") or "N/A",
+                  "testCaseRequestType": os.environ.get("TEST_CASE_REQUEST_TYPE") or "N/A",
+                  "browser": os.environ.get("BROWSER") or "N/A",
+                  "environment": os.environ.get("ENVIRONMENT") or "N/A",
+                  "buildNumber": build_number,
+                  "buildUrl": run_url,
+                  "timestamp": timestamp,
+              }
+
+          result = {
+              "status": status,
+              "stage": stage,
+              "message": message,
+              "timestamp": timestamp,
+              "buildNumber": build_number,
+              "buildUrl": run_url,
+          }
+          if error_code:
+              result["errorCode"] = error_code
+          metadata["executionResult"] = result
+          with open(meta_path, "w", encoding="utf-8") as f:
+              json.dump(metadata, f, indent=4)
+          print(f"executionResult written: status={status} stage={stage} errorCode={error_code or 'N/A'}")
+          PY
+
+      # 3. Checkout Client Repository (+ materialize tests — Jenkins checkoutRepository)
+      - name: Checkout Client Repository
+        env:
+          CLIENT_REPO_URL: ${{ github.event.inputs.client_repo_url }}
+          CLIENT_BRANCH: ${{ github.event.inputs.client_branch }}
+          CLIENT_USERNAME: ${{ github.event.inputs.client_username }}
+          CLIENT_PAT_ENCRYPTED: ${{ github.event.inputs.client_pat }}
+          TEST_CASE_REQUEST_TYPE: ${{ github.event.inputs.testCaseRequestType }}
+        run: |
+          set -e
+
+          decrypt_value() {
+            local encrypted="$1"
+            local enc_file out_file
+            enc_file=$(mktemp)
+            out_file=$(mktemp)
+            printf '%s' "$encrypted" > "$enc_file"
+            set +x
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -a -A -in "$enc_file" -out "$out_file" -pass env:ENCRYPTION_KEY; then
+              rm -f "$enc_file" "$out_file"
+              echo "::error::OpenSSL decryption failed (invalid key or corrupt data)"
+              return 1
+            fi
+            local plaintext
+            plaintext=$(tr -d '\r\n' < "$out_file")
+            rm -f "$enc_file" "$out_file"
+            if [ -z "$plaintext" ]; then
+              echo "::error::Decrypted value is empty"
+              return 1
+            fi
+            printf '%s' "$plaintext"
+          }
+
+          if [ -z "${CLIENT_REPO_URL// }" ]; then
+            echo "::error::client_repo_url is mandatory"
+            python3 .pipeline-write-er.py FAILED Checkout INVALID_REPOSITORY_URL "Unable to access the client repository. Verify the repository URL." || true
+            exit 1
+          fi
+          if [ -z "${CLIENT_USERNAME// }" ]; then
+            echo "::error::client_username is mandatory"
+            python3 .pipeline-write-er.py FAILED Checkout INVALID_REPOSITORY_CREDENTIALS "Invalid GitHub username or Personal Access Token." || true
+            exit 1
+          fi
+          if [ -z "${CLIENT_BRANCH// }" ]; then
+            echo "::error::client_branch is mandatory"
+            python3 .pipeline-write-er.py FAILED Checkout BRANCH_NOT_FOUND "Specified branch was not found in the client repository." || true
+            exit 1
+          fi
+          if [ -z "${CLIENT_PAT_ENCRYPTED// }" ]; then
+            echo "::error::client_pat is mandatory"
+            python3 .pipeline-write-er.py FAILED Checkout INVALID_CLIENT_PAT "Invalid GitHub Personal Access Token. Please verify the encrypted client_pat." || true
+            exit 1
+          fi
+          if [ -z "${ENCRYPTION_KEY// }" ]; then
+            echo "::error::Missing encryption key secret (Jenkins: aws-encryption-key)."
+            echo "Add repository or Environment secret named one of: AWS_ENCRYPTION_KEY, ENCRYPTION_KEY, aws-encryption-key"
+            echo "Job uses environment '${{ github.event.inputs.environment }}' — if that Environment exists, add the secret there too."
+            python3 .pipeline-write-er.py FAILED Checkout INVALID_CLIENT_PAT "Invalid GitHub Personal Access Token. Please verify the encrypted client_pat." || true
+            exit 1
+          fi
+
+          if ! CLIENT_GIT_PASSWORD=$(decrypt_value "$CLIENT_PAT_ENCRYPTED"); then
+            python3 .pipeline-write-er.py FAILED Checkout INVALID_CLIENT_PAT "Invalid GitHub Personal Access Token. Please verify the encrypted client_pat." || true
+            exit 1
+          fi
+
+          REPO_HOST_PATH="${CLIENT_REPO_URL#https://}"
+          REPO_HOST_PATH="${REPO_HOST_PATH#http://}"
+          case "$(echo "$REPO_HOST_PATH" | tr '[:upper:]' '[:lower:]')" in
+            github.com/*) AUTH_USER="x-access-token" ;;
+            *) AUTH_USER="$CLIENT_USERNAME" ;;
+          esac
+
+          rm -rf client-tests
+          set +e
+          set +x
+          CLONE_LOG=$(git clone --depth 1 --no-tags --branch "$CLIENT_BRANCH" \
+            "https://${AUTH_USER}:${CLIENT_GIT_PASSWORD}@${REPO_HOST_PATH}" client-tests 2>&1)
+          CLONE_STATUS=$?
+          unset CLIENT_GIT_PASSWORD
+          printf '%s\n' "$CLONE_LOG" > clone_out.txt
+          set -e
+
+          if [ "$CLONE_STATUS" -ne 0 ]; then
+            LOG_LOWER=$(echo "$CLONE_LOG" | tr '[:upper:]' '[:lower:]')
+            CODE="CLIENT_REPO_CLONE_FAILED"
+            MSG="Failed to clone the client repository."
+            if echo "$LOG_LOWER" | grep -q "remote branch" && echo "$LOG_LOWER" | grep -q "not found"; then
+              CODE="BRANCH_NOT_FOUND"
+              MSG="Specified branch was not found in the client repository."
+            elif echo "$LOG_LOWER" | grep -Eq "authentication failed|invalid username|403|could not read username"; then
+              CODE="INVALID_REPOSITORY_CREDENTIALS"
+              MSG="Invalid GitHub username or Personal Access Token."
+            elif echo "$LOG_LOWER" | grep -Eq "repository not found|404"; then
+              CODE="INVALID_REPOSITORY_URL"
+              MSG="Unable to access the client repository. Verify the repository URL."
+            fi
+            echo "::error::${MSG}"
+            python3 .pipeline-write-er.py FAILED Checkout "$CODE" "$MSG" || true
+            rm -f clone_out.txt
+            exit 1
+          fi
+          rm -f clone_out.txt
+          echo "✅ Client repository checked out: ${CLIENT_REPO_URL} @ ${CLIENT_BRANCH}"
+
+          REQUEST_TYPE=$(printf '%s' "${TEST_CASE_REQUEST_TYPE:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          if [ "$REQUEST_TYPE" = "IMPORTED" ]; then
+            echo "📥 IMPORT checkout — customer repository is the Playwright project root"
+            if [ ! -f "client-tests/package.json" ]; then
+              echo "::error::client-tests/package.json not found — IMPORTED repo must be a Playwright project"
+              python3 .pipeline-write-er.py FAILED Checkout INVALID_IMPORT_PROJECT "IMPORTED customer repository is missing package.json or could not be prepared as the Playwright project root" || true
+              exit 1
+            fi
+            cp -f .pipeline-write-er.py /tmp/.pipeline-write-er.py
+            find . -mindepth 1 -maxdepth 1 ! -name client-tests ! -name .pipeline-write-er.py -exec rm -rf {} +
+            bash -c 'shopt -s dotglob nullglob; mv client-tests/* .'
+            rmdir client-tests 2>/dev/null || rm -rf client-tests
+            cp -f /tmp/.pipeline-write-er.py .pipeline-write-er.py
+            if [ ! -f package.json ]; then
+              echo "::error::IMPORTED customer repository is missing package.json or could not be prepared as the Playwright project root"
+              python3 .pipeline-write-er.py FAILED Checkout INVALID_IMPORT_PROJECT "IMPORTED customer repository is missing package.json or could not be prepared as the Playwright project root" || true
+              exit 1
+            fi
+            echo "✅ IMPORT customer Playwright project ready at workspace root"
+          else
+            if [ ! -d "client-tests/tests" ]; then
+              echo "::error::client-tests/tests not found in client repository"
+              python3 .pipeline-write-er.py FAILED Checkout TESTS_FOLDER_NOT_FOUND "client-tests/tests not found in client repository" || true
+              exit 1
+            fi
+
+            chmod -R u+w tests 2>/dev/null || true
+            rm -rf tests
+            cp -a client-tests/tests ./tests
+            echo "✅ Copied client-tests/tests → tests/"
+
+            if [ ! -d tests ] || [ -z "$(find tests -mindepth 1 -print -quit)" ]; then
+              echo "::error::tests/ directory is missing or empty after client repository checkout"
+              python3 .pipeline-write-er.py FAILED Checkout TESTS_FOLDER_NOT_FOUND "tests/ directory is missing or empty after client repository checkout" || true
+              exit 1
+            fi
+            echo "✅ tests/ directory verified"
+          fi
+
+      # 4. Validate Inputs
+      - name: Validate Inputs
+        env:
+          AWS_ACCESS_KEY_ID: ${{ github.event.inputs.aws_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ github.event.inputs.aws_secret_access_key }}
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+        run: |
+          set -e
+          missing=""
+          [ -z "${AWS_ACCESS_KEY_ID// }" ] && missing="$missing aws_access_key_id"
+          [ -z "${AWS_SECRET_ACCESS_KEY// }" ] && missing="$missing aws_secret_access_key"
+          [ -z "${SUITE_TESTCASE// }" ] && missing="$missing suite_testcase"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required values:$missing"
+            python3 .pipeline-write-er.py FAILED "Validate Suite" INVALID_SUITE_JSON "suite_testcase is mandatory" || true
+            exit 1
+          fi
+
+          if ! echo "$SUITE_TESTCASE" | python3 -c '
+          import json,sys
+          try:
+              data=json.load(sys.stdin)
+          except Exception as e:
+              raise SystemExit(f"Invalid suite_testcase JSON: {e}")
+          if not isinstance(data, dict) or not data:
+              raise SystemExit("suite_testcase must be a non-empty JSON object")
+          print("suite_testcase OK:", ", ".join(data.keys()))
+          '; then
+            python3 .pipeline-write-er.py FAILED "Validate Suite" INVALID_SUITE_JSON "Invalid suite_testcase JSON" || true
+            exit 1
+          fi
+
+          missing_secrets=""
+          [ -z "$BASE_URL" ] && missing_secrets="$missing_secrets BASE_URL"
+          [ -z "$USER_NAME" ] && missing_secrets="$missing_secrets USER_NAME"
+          [ -z "$PASSWORD" ] && missing_secrets="$missing_secrets PASSWORD"
+          if [ -n "$missing_secrets" ]; then
+            echo "::error::Missing required environment secrets/vars:$missing_secrets"
+            echo "Add them under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          echo "✅ Inputs validated"
+
+      # Jenkins Debug Workspace
+      - name: Debug Workspace
+        run: |
+          echo "🔍 Inspecting workspace structure..."
+          pwd
+          ls -la
+          find . -maxdepth 3
+          sleep 2
+
+      # 5. Validate Suite — soft collect (Jenkins validateSuiteTestcase; do NOT hard-fail)
+      - name: Validate Suite
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+        run: |
+          set -e
+          echo "🔍 Discovering suite directories under tests/..."
+
+          SUITE_PATH_MAP_FILE=$(mktemp)
+          : > "$SUITE_PATH_MAP_FILE"
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            name=$(basename "$dir")
+            printf '%s|%s\n' "$name" "$dir" >> "$SUITE_PATH_MAP_FILE"
+          done < <(find tests -type d ! -path tests ! -path '*/.*' 2>/dev/null)
+
+          python3 - "$SUITE_PATH_MAP_FILE" <<'PY'
+          import json, os, sys
+          from collections import defaultdict
+
+          map_file = sys.argv[1]
+          groups = defaultdict(list)
+          with open(map_file, encoding='utf-8') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or '|' not in line:
+                      continue
+                  name, path = line.split('|', 1)
+                  groups[name].append(path)
+
+          suite_map = {}
+          for name, paths in groups.items():
+              suite_map[name] = paths[0] if len(paths) == 1 else paths
+
+          cache_path = os.path.join(os.getcwd(), '.suite-path-map.json')
+          with open(cache_path, 'w', encoding='utf-8') as out:
+              json.dump(suite_map, out)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as envf:
+              envf.write(f"SUITE_PATH_MAP_FILE={cache_path}\n")
+
+          print(f"✅ Discovered {len(suite_map)} suite name(s): {', '.join(suite_map.keys())}")
+          for name, path in suite_map.items():
+              display = ', '.join(path) if isinstance(path, list) else path
+              print(f"   {name} → {display}")
+          PY
+
+          # Soft suite validation — collect valid/failed; never exit 1 here
+          python3 - <<'PY'
+          import json, os
+
+          suite_testcase = json.loads(os.environ['SUITE_TESTCASE'])
+          with open('.suite-path-map.json', encoding='utf-8') as f:
+              suite_map = json.load(f)
+
+          def try_resolve(suite):
+              if suite not in suite_map:
+                  return None
+              path = suite_map[suite]
+              if isinstance(path, list):
+                  if len(path) != 1:
+                      print(f"❌ Ambiguous suite '{suite}': found at {', '.join(path)}")
+                      return None
+                  path = path[0]
+              if not os.path.isdir(path):
+                  return None
+              return path
+
+          valid_suites = []
+          failed_suites = []
+          filtered = {}
+
+          for suite, testcases in suite_testcase.items():
+              print(f"Validating suite: {suite}")
+              if not isinstance(testcases, list) or not testcases:
+                  failed_suites.append(suite)
+                  print(f"❌ Suite '{suite}' has empty/invalid testcase list")
+                  continue
+              suite_dir = try_resolve(suite)
+              if not suite_dir:
+                  failed_suites.append(suite)
+                  print(f"❌ Suite '{suite}' not found under tests/")
+                  continue
+              valid_suites.append(suite)
+              filtered[suite] = testcases
+              print(f"✅ Suite '{suite}' validated at {suite_dir}")
+
+          open('.pipeline-valid-suites.json', 'w', encoding='utf-8').write(json.dumps(valid_suites))
+          open('.pipeline-failed-suites.json', 'w', encoding='utf-8').write(json.dumps(failed_suites))
+          open('.pipeline-filtered-suite-testcase.json', 'w', encoding='utf-8').write(json.dumps(filtered))
+          open('.pipeline-upload-zips.json', 'w', encoding='utf-8').write(json.dumps([]))
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as envf:
+              envf.write(f"HAS_INVALID_SUITES={'true' if failed_suites else 'false'}\n")
+              if not filtered:
+                  envf.write("SKIP_PLAYWRIGHT=true\n")
+              else:
+                  envf.write("SKIP_PLAYWRIGHT=false\n")
+
+          print(f"📊 Suite validation: valid={len(valid_suites)}, failed={len(failed_suites)}")
+          PY
+
+      # 6. Setup (installDependenciesOptimized + browsers)
+      - name: Setup Node
+        if: env.SKIP_PLAYWRIGHT != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Setup
+        if: env.SKIP_PLAYWRIGHT != 'true'
+        env:
+          BROWSER: ${{ github.event.inputs.browser }}
+        run: |
+          set -e
+          if [ "${TEST_CASE_REQUEST_TYPE}" = "IMPORTED" ]; then
+            echo "📦 IMPORT Setup — customer dependencies"
+            if [ ! -f package.json ]; then
+              echo "::error::IMPORT customer package.json not found"
+              python3 .pipeline-write-er.py FAILED Setup SETUP_FAILED "IMPORT customer package.json not found" || true
+              exit 1
+            fi
+            if [ -f package-lock.json ]; then
+              npm ci --no-audit --no-fund || {
+                python3 .pipeline-write-er.py FAILED Setup SETUP_FAILED "IMPORT npm ci failed" || true
+                exit 1
+              }
+            else
+              npm install --no-audit --no-fund || {
+                python3 .pipeline-write-er.py FAILED Setup SETUP_FAILED "IMPORT npm install failed" || true
+                exit 1
+              }
+            fi
+            echo "✅ IMPORT npm dependencies installed"
+
+            npx playwright install-deps || true
+            npx playwright install chrome || {
+              python3 .pipeline-write-er.py FAILED Setup SETUP_FAILED "playwright install failed" || true
+              exit 1
+            }
+            case "$BROWSER" in
+              firefox)
+                npx playwright install firefox || {
+                  python3 .pipeline-write-er.py FAILED Setup SETUP_FAILED "playwright install failed" || true
+                  exit 1
+                }
+                ;;
+              webkit)
+                npx playwright install webkit || {
+                  python3 .pipeline-write-er.py FAILED Setup SETUP_FAILED "playwright install failed" || true
+                  exit 1
+                }
+                ;;
+              chromium)
+                npx playwright install chromium || true
+                ;;
+            esac
+            echo "✅ IMPORT Playwright browser installation completed"
+          else
+            echo "📦 Installing dependencies..."
+            current_hash=$(md5sum package-lock.json 2>/dev/null | cut -d' ' -f1 || echo 'none')
+            needs_install=1
+            if [ -f "$NPM_HASH_FILE" ] && [ -d "node_modules/@playwright" ]; then
+              saved_hash=$(cat "$NPM_HASH_FILE")
+              if [ "$saved_hash" = "$current_hash" ]; then
+                needs_install=0
+                echo "✅ Dependencies up to date (hash match: ${current_hash})"
+              fi
+            fi
+
+            if [ "$needs_install" -eq 1 ]; then
+              if [ -f package-lock.json ]; then
+                npm ci --prefer-offline --no-audit --no-fund || {
+                  python3 .pipeline-write-er.py FAILED Setup SETUP_FAILED "NPM installation failed" || true
+                  exit 1
+                }
+              else
+                npm install --prefer-offline --no-audit --no-fund || {
+                  python3 .pipeline-write-er.py FAILED Setup SETUP_FAILED "NPM installation failed" || true
+                  exit 1
+                }
+              fi
+              echo "$current_hash" > "$NPM_HASH_FILE"
+              echo "✅ Dependencies installed successfully (hash saved)"
+            fi
+
+            npx playwright install-deps
+            npx playwright install
+            echo "✅ Setup completed successfully"
+          fi
+
+      # 6b. Validate Testcases (Jenkins: after Setup — playwright --list + .spec.ts find)
+      - name: Validate Testcases
+        if: env.SKIP_PLAYWRIGHT != 'true'
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+          BROWSER: ${{ github.event.inputs.browser }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          TEST_CASE_REQUEST_TYPE: ${{ github.event.inputs.testCaseRequestType }}
+        run: |
+          set -e
+          case "$BROWSER" in
+            chrome|chromium) PLAYWRIGHT_PROJECT="chromium" ;;
+            firefox) PLAYWRIGHT_PROJECT="firefox" ;;
+            webkit) PLAYWRIGHT_PROJECT="webkit" ;;
+            *) PLAYWRIGHT_PROJECT="$BROWSER" ;;
+          esac
+          export PLAYWRIGHT_PROJECT
+
+          python3 - <<'PY'
+          import json, os, subprocess, glob
+
+          with open('.pipeline-filtered-suite-testcase.json', encoding='utf-8') as f:
+              filtered_in = json.load(f)
+          with open(os.environ.get('SUITE_PATH_MAP_FILE', '.suite-path-map.json'), encoding='utf-8') as f:
+              suite_map = json.load(f)
+
+          def resolve(suite):
+              path = suite_map.get(suite)
+              if path is None:
+                  return None
+              if isinstance(path, list):
+                  return path[0] if len(path) == 1 else None
+              return path if os.path.isdir(path) else None
+
+          def find_spec(suite_dir, name):
+              base = name.split('/')[-1]
+              matches = glob.glob(os.path.join(suite_dir, '**', base), recursive=True)
+              matches = [m for m in matches if os.path.isfile(m)]
+              return matches[0] if matches else None
+
+          def list_titles(suite_dir):
+              pw = './node_modules/.bin/playwright' if os.path.isfile('./node_modules/.bin/playwright') else 'npx playwright'
+              is_imported = os.environ.get('TEST_CASE_REQUEST_TYPE', '').strip() == 'IMPORTED'
+              if is_imported:
+                  browser = os.environ.get('BROWSER', '')
+                  environment = os.environ.get('ENVIRONMENT', '')
+                  cmd = f"npx cross-env BROWSER='{browser}' ENV='{environment}' {pw} test '{suite_dir}' --list"
+              else:
+                  project = os.environ.get('PLAYWRIGHT_PROJECT', 'chromium')
+                  cmd = f"{pw} test '{suite_dir}' --list --project='{project}'"
+              print(f"📋 Listing Playwright tests: {cmd}")
+              try:
+                  out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, text=True)
+              except subprocess.CalledProcessError as e:
+                  out = e.output or ''
+              titles = []
+              for line in out.splitlines():
+                  trimmed = line.strip()
+                  if not trimmed or '›' not in trimmed:
+                      continue
+                  if trimmed.startswith('Listing') or trimmed.startswith('Total:'):
+                      continue
+                  parts = trimmed.split('›')
+                  if len(parts) < 3:
+                      continue
+                  leaf = parts[-1].strip()
+                  if leaf and leaf not in titles:
+                      titles.append(leaf)
+              print(f"📋 Parsed {len(titles)} unique testcase title(s) from --list")
+              return titles
+
+          filtered = {}
+          executed = []
+          missing = []
+          missing_by_suite = {}
+          failed_suites = []
+          if os.path.isfile('.pipeline-failed-suites.json'):
+              failed_suites = json.load(open('.pipeline-failed-suites.json', encoding='utf-8'))
+
+          for suite, testcases in filtered_in.items():
+              suite_dir = resolve(suite)
+              if not suite_dir:
+                  print(f"⚠️ Skipping testcase validation for suite '{suite}'")
+                  continue
+              print(f"Validating testcases for suite: {suite} ({suite_dir})")
+              if 'all' in testcases:
+                  filtered[suite] = testcases
+                  print(f"Suite '{suite}' uses 'all' — skipping per-testcase validation")
+                  continue
+
+              suite_titles = None
+              existing = []
+              suite_missing = []
+              for name in testcases:
+                  if not isinstance(name, str) or not name.strip():
+                      continue
+                  name = name.strip()
+                  if name.endswith('.spec.ts'):
+                      found = find_spec(suite_dir, name)
+                      if found:
+                          existing.append(name)
+                          executed.append(name)
+                          print(f"✅ Spec file found: {found}")
+                      else:
+                          suite_missing.append(name)
+                          missing.append(name)
+                          print(f"❌ Spec file not found under {suite_dir}: {name}")
+                  else:
+                      if suite_titles is None:
+                          suite_titles = list_titles(suite_dir)
+                          print(f"📋 Discovered {len(suite_titles)} Playwright title(s) under {suite_dir}")
+                          for t in suite_titles:
+                              print(f"   • {t}")
+                      if name in suite_titles:
+                          existing.append(name)
+                          executed.append(name)
+                          print(f"✅ Title found: {name}")
+                      else:
+                          suite_missing.append(name)
+                          missing.append(name)
+                          print(f"❌ Title not found in suite '{suite}': {name}")
+              if suite_missing:
+                  missing_by_suite[suite] = suite_missing
+              if existing:
+                  filtered[suite] = existing
+
+          open('.pipeline-executed-testcases.json', 'w', encoding='utf-8').write(json.dumps(executed))
+          open('.pipeline-missing-testcases.json', 'w', encoding='utf-8').write(json.dumps(missing))
+          open('.pipeline-missing-by-suite.json', 'w', encoding='utf-8').write(json.dumps(missing_by_suite))
+          open('.pipeline-filtered-suite-testcase.json', 'w', encoding='utf-8').write(json.dumps(filtered))
+
+          has_executable = bool(filtered)
+          has_invalid = bool(failed_suites) or bool(missing)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as envf:
+              if not has_executable:
+                  envf.write("SKIP_PLAYWRIGHT=true\n")
+                  envf.write("PARTIAL_TESTCASES=false\n")
+                  print('❌ No valid suites/testcases remain — Playwright will be skipped')
+              elif has_invalid:
+                  envf.write("SKIP_PLAYWRIGHT=false\n")
+                  envf.write("PARTIAL_TESTCASES=true\n")
+                  print(f"⚠️ Partial validation — execute valid only (suites failed={len(failed_suites)}, missing={len(missing)})")
+              else:
+                  envf.write("SKIP_PLAYWRIGHT=false\n")
+                  envf.write("PARTIAL_TESTCASES=false\n")
+                  print('✅ All requested suites/testcases validated')
+          PY
+
+      # 7. Create Metadata
+      - name: Create Metadata
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+          BROWSER: ${{ github.event.inputs.browser }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          S3_PREFIX: ${{ github.event.inputs.s3_prefix }}
+          TENANT_ID: ${{ github.event.inputs.tenantId }}
+          APPLICATION_ID: ${{ github.event.inputs.applicationId }}
+          TEST_RUN_ID: ${{ github.event.inputs.test_run_id }}
+          TEST_EXECUTION_ID: ${{ github.event.inputs.test_execution_id }}
+          TEST_EXECUTION_REQUEST_ID: ${{ github.event.inputs.test_execution_request_id }}
+          TEST_CASE_REQUEST_TYPE: ${{ github.event.inputs.testCaseRequestType }}
+        run: |
+          set -e
+          echo "📝 Creating metadata..."
+          python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+
+          run_url = (
+              f"{os.environ.get('GITHUB_SERVER_URL', '')}/"
+              f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/"
+              f"{os.environ.get('GITHUB_RUN_ID', '')}"
+          )
+          metadata = {
+              "tenantId": os.environ.get("TENANT_ID") or "N/A",
+              "applicationId": os.environ.get("APPLICATION_ID") or "N/A",
+              "test_run_id": os.environ.get("TEST_RUN_ID") or "N/A",
+              "test_execution_id": os.environ.get("TEST_EXECUTION_ID") or "N/A",
+              "test_execution_request_id": os.environ.get("TEST_EXECUTION_REQUEST_ID") or "N/A",
+              "testCaseRequestType": os.environ.get("TEST_CASE_REQUEST_TYPE") or "N/A",
+              "suite_testcase": json.loads(os.environ["SUITE_TESTCASE"]),
+              "browser": os.environ["BROWSER"],
+              "environment": os.environ["ENVIRONMENT"],
+              "s3_prefix": os.environ["S3_PREFIX"],
+              "github_run_id": os.environ.get("GITHUB_RUN_ID", "N/A"),
+              "github_run_number": os.environ.get("GITHUB_RUN_NUMBER", "N/A"),
+              "github_workflow": os.environ.get("GITHUB_WORKFLOW", "N/A"),
+              "github_run_url": run_url,
+              "jenkins_build_id": os.environ.get("GITHUB_RUN_ID", "N/A"),
+              "jenkins_build_number": os.environ.get("GITHUB_RUN_NUMBER", "N/A"),
+              "jenkins_job_name": os.environ.get("GITHUB_WORKFLOW", "N/A"),
+              "jenkins_build_url": run_url,
+              "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+
+          path = os.environ["METADATA_FILE"]
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(metadata, f, indent=4)
+          print(f"✅ Metadata file created: {path}")
+          PY
+          if [ ! -f "$METADATA_FILE" ]; then
+            python3 .pipeline-write-er.py FAILED "Create Metadata" METADATA_FAILED "Failed to create metadata file: ${METADATA_FILE}" || true
+            exit 1
+          fi
+          cat "$METADATA_FILE"
+          ls -lh "$METADATA_FILE"
+
+      # 8. Execute Tests (runSuiteTestcases / finalizeValidationOnlyRun)
+      - name: Execute Tests
+        id: execute_tests
+        timeout-minutes: 100
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+          BROWSER: ${{ github.event.inputs.browser }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          WORKERS: ${{ github.event.inputs.workers }}
+        run: |
+          set -e
+
+          # --- helpers: executionResult + Failure_Validation.zip (Jenkins parity) ---
+          write_execution_result() {
+            local status="$1" stage="$2" error_code="$3" message="$4"
+            STATUS="$status" STAGE="$stage" ERROR_CODE="$error_code" MESSAGE="$message" python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+
+          meta_path = os.environ.get("METADATA_FILE", "metadata.json")
+          status = os.environ["STATUS"]
+          stage = os.environ["STAGE"]
+          error_code = (os.environ.get("ERROR_CODE") or "").strip()
+          message = os.environ.get("MESSAGE") or ""
+
+          run_url = (
+              f"{os.environ.get('GITHUB_SERVER_URL', '')}/"
+              f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/"
+              f"{os.environ.get('GITHUB_RUN_ID', '')}"
+          )
+          build_number = os.environ.get("GITHUB_RUN_NUMBER", "N/A")
+          timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          if os.path.isfile(meta_path):
+              with open(meta_path, encoding="utf-8") as f:
+                  metadata = json.load(f)
+              existing = metadata.get("executionResult") or {}
+              if status == "FAILED" and existing.get("status") == "FAILED":
+                  existing_code = str(existing.get("errorCode") or "")
+                  if error_code == "UNEXPECTED_ERROR" and existing_code and existing_code != "UNEXPECTED_ERROR":
+                      print(f"📝 executionResult already recorded ({existing_code}) — keeping specific failure over UNEXPECTED_ERROR")
+                      raise SystemExit(0)
+              existing_status = str(existing.get("status") or "")
+              if existing_status in ("PARTIAL_SUCCESS", "PARTIAL_FAILED") and error_code == "UNEXPECTED_ERROR":
+                  print(f"📝 executionResult already {existing_status} — keeping it over UNEXPECTED_ERROR")
+                  raise SystemExit(0)
+          else:
+              metadata = {
+                  "tenantId": "N/A",
+                  "applicationId": "N/A",
+                  "test_run_id": "N/A",
+                  "test_execution_id": "N/A",
+                  "test_execution_request_id": "N/A",
+                  "testCaseRequestType": "N/A",
+                  "browser": os.environ.get("BROWSER", "N/A"),
+                  "environment": "N/A",
+                  "buildNumber": build_number,
+                  "buildUrl": run_url,
+                  "timestamp": timestamp,
+              }
+
+          result = {
+              "status": status,
+              "stage": stage,
+              "message": message,
+              "timestamp": timestamp,
+              "buildNumber": build_number,
+              "buildUrl": run_url,
+          }
+          if error_code:
+              result["errorCode"] = error_code
+
+          metadata["executionResult"] = result
+          with open(meta_path, "w", encoding="utf-8") as f:
+              json.dump(metadata, f, indent=4)
+          print(f"📝 metadata.json executionResult written: status={status}, stage={stage}, errorCode={error_code or 'N/A'}")
+          PY
+          }
+
+          merge_validation_lists() {
+            python3 - <<'PY'
+          import json, os
+
+          meta_path = os.environ.get("METADATA_FILE", "metadata.json")
+          if not os.path.isfile(meta_path):
+              raise SystemExit(0)
+
+          def load_list(path):
+              if not os.path.isfile(path):
+                  return []
+              with open(path, encoding="utf-8") as f:
+                  data = json.load(f)
+              return [str(x) for x in (data or [])]
+
+          with open(meta_path, encoding="utf-8") as f:
+              metadata = json.load(f)
+          if not isinstance(metadata.get("executionResult"), dict):
+              raise SystemExit(0)
+
+          valid_suites = load_list(".pipeline-valid-suites.json")
+          failed_suites = load_list(".pipeline-failed-suites.json")
+          valid_testcases = load_list(".pipeline-executed-testcases.json")
+          missing_testcases = load_list(".pipeline-missing-testcases.json")
+
+          er = metadata["executionResult"]
+          er["validSuites"] = valid_suites
+          er["failedSuites"] = failed_suites
+          er["validTestcases"] = valid_testcases
+          er["missingTestcases"] = missing_testcases
+          metadata["validSuites"] = valid_suites
+          metadata["failedSuites"] = failed_suites
+          metadata["validTestcases"] = valid_testcases
+          metadata["missingTestcases"] = missing_testcases
+
+          with open(meta_path, "w", encoding="utf-8") as f:
+              json.dump(metadata, f, indent=4)
+          print("📝 Merged validation lists into metadata.json")
+          PY
+          }
+
+          write_final_validation_execution_result() {
+            local playwright_exit="$1" did_execute="$2"
+            python3 - <<PY
+          import json, os, subprocess
+
+          def load_list(path):
+              if not os.path.isfile(path):
+                  return []
+              with open(path, encoding="utf-8") as f:
+                  data = json.load(f)
+              return [str(x) for x in (data or [])]
+
+          playwright_exit = int("${playwright_exit}")
+          did_execute = "${did_execute}" == "true"
+          valid_suites = load_list(".pipeline-valid-suites.json")
+          failed_suites = load_list(".pipeline-failed-suites.json")
+          valid_testcases = load_list(".pipeline-executed-testcases.json")
+          missing_testcases = load_list(".pipeline-missing-testcases.json")
+
+          def call_write(status, stage, code, msg):
+              env = os.environ.copy()
+              env.update({"STATUS": status, "STAGE": stage, "ERROR_CODE": code, "MESSAGE": msg})
+              # invoke via shell helper already defined — write inline here
+              meta_path = os.environ.get("METADATA_FILE", "metadata.json")
+              from datetime import datetime, timezone
+              run_url = (
+                  f"{os.environ.get('GITHUB_SERVER_URL', '')}/"
+                  f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/"
+                  f"{os.environ.get('GITHUB_RUN_ID', '')}"
+              )
+              build_number = os.environ.get("GITHUB_RUN_NUMBER", "N/A")
+              timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+              if os.path.isfile(meta_path):
+                  with open(meta_path, encoding="utf-8") as f:
+                      metadata = json.load(f)
+              else:
+                  metadata = {}
+              result = {
+                  "status": status,
+                  "stage": stage,
+                  "message": msg,
+                  "timestamp": timestamp,
+                  "buildNumber": build_number,
+                  "buildUrl": run_url,
+              }
+              if code:
+                  result["errorCode"] = code
+              metadata["executionResult"] = result
+              with open(meta_path, "w", encoding="utf-8") as f:
+                  json.dump(metadata, f, indent=4)
+              print(f"📝 executionResult: status={status}, stage={stage}, errorCode={code or 'N/A'}")
+
+          if did_execute and playwright_exit != 0:
+              call_write("FAILED", "Execute Tests", "PLAYWRIGHT_FAILED", f"Playwright tests failed with exit code: {playwright_exit}")
+              raise SystemExit(0)
+
+          has_suite_failures = bool(failed_suites)
+          has_testcase_failures = bool(missing_testcases)
+
+          if not did_execute:
+              error_code = "SUITE_NOT_FOUND" if has_suite_failures else "TESTCASE_NOT_FOUND"
+              msg = (
+                  f"All requested suites were invalid: {', '.join(failed_suites)}"
+                  if has_suite_failures
+                  else f"All requested testcases were invalid: {', '.join(missing_testcases)}"
+              )
+              call_write("FAILED", "Completed", error_code, msg)
+              # merge lists
+              meta_path = os.environ.get("METADATA_FILE", "metadata.json")
+              with open(meta_path, encoding="utf-8") as f:
+                  metadata = json.load(f)
+              er = metadata["executionResult"]
+              er["validSuites"] = valid_suites
+              er["failedSuites"] = failed_suites
+              er["validTestcases"] = valid_testcases
+              er["missingTestcases"] = missing_testcases
+              metadata["validSuites"] = valid_suites
+              metadata["failedSuites"] = failed_suites
+              metadata["validTestcases"] = valid_testcases
+              metadata["missingTestcases"] = missing_testcases
+              with open(meta_path, "w", encoding="utf-8") as f:
+                  json.dump(metadata, f, indent=4)
+              raise SystemExit(0)
+
+          if has_suite_failures or has_testcase_failures:
+              error_code = "PARTIAL_SUITE_NOT_FOUND" if has_suite_failures else "PARTIAL_TESTCASE_NOT_FOUND"
+              parts = []
+              if has_suite_failures:
+                  parts.append(f"{len(valid_suites)} suite(s) valid, {len(failed_suites)} suite(s) not found")
+              if has_testcase_failures:
+                  parts.append(f"{len(valid_testcases)} testcase(s) executed, {len(missing_testcases)} testcase(s) not found")
+              call_write("PARTIAL_FAILED", "Completed", error_code, ". ".join(parts) + ".")
+              meta_path = os.environ.get("METADATA_FILE", "metadata.json")
+              with open(meta_path, encoding="utf-8") as f:
+                  metadata = json.load(f)
+              er = metadata["executionResult"]
+              er["validSuites"] = valid_suites
+              er["failedSuites"] = failed_suites
+              er["validTestcases"] = valid_testcases
+              er["missingTestcases"] = missing_testcases
+              metadata["validSuites"] = valid_suites
+              metadata["failedSuites"] = failed_suites
+              metadata["validTestcases"] = valid_testcases
+              metadata["missingTestcases"] = missing_testcases
+              with open(meta_path, "w", encoding="utf-8") as f:
+                  json.dump(metadata, f, indent=4)
+              raise SystemExit(0)
+
+          call_write("SUCCESS", "Completed", "", "Execution completed successfully")
+          PY
+          }
+
+          add_pending_upload_zip() {
+            local zip_name="$1"
+            ZIP_TO_ADD="$zip_name" python3 - <<'PY'
+          import json, os
+          path = ".pipeline-upload-zips.json"
+          zips = []
+          if os.path.isfile(path):
+              with open(path, encoding="utf-8") as f:
+                  zips = list(json.load(f) or [])
+          name = (os.environ.get("ZIP_TO_ADD") or "").strip()
+          if name and name not in zips:
+              zips.append(name)
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(zips, f)
+          print(f"📦 Pending upload ZIPs: {zips}")
+          PY
+          }
+
+          package_validation_failure_zip() {
+            python3 - <<'PY'
+          import json, os, subprocess, shutil
+
+          failed_suites = []
+          if os.path.isfile(".pipeline-failed-suites.json"):
+              failed_suites = list(json.load(open(".pipeline-failed-suites.json", encoding="utf-8")) or [])
+          missing_by_suite = {}
+          if os.path.isfile(".pipeline-missing-by-suite.json"):
+              missing_by_suite = json.load(open(".pipeline-missing-by-suite.json", encoding="utf-8")) or {}
+
+          failure_info = {
+              "invalidSuites": [str(x) for x in failed_suites],
+              "invalidTestcases": {str(k): [str(x) for x in (v or [])] for k, v in missing_by_suite.items()},
+          }
+          print(f"📦 Packaging Failure_Validation.zip (invalidSuites={len(failure_info['invalidSuites'])}, suitesWithMissingTestcases={len(failure_info['invalidTestcases'])})")
+
+          meta = os.environ.get("METADATA_FILE", "metadata.json")
+          suite_dir = "Failure_Validation"
+          zip_name = "Failure_Validation.zip"
+          os.makedirs(suite_dir, exist_ok=True)
+          if os.path.isfile(meta):
+              shutil.copy2(meta, suite_dir)
+          with open(os.path.join(suite_dir, "failure_info.json"), "w", encoding="utf-8") as f:
+              json.dump(failure_info, f, indent=2)
+          rc = subprocess.call(["zip", "-r", "-q", "-6", zip_name, suite_dir])
+          shutil.rmtree(suite_dir, ignore_errors=True)
+          if rc != 0 or not os.path.isfile(zip_name):
+              raise SystemExit("Failed to create Failure_Validation.zip")
+          print(f"✅ Failure ZIP ready: {zip_name}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
+              envf.write(f"ZIP_NAME=\n")
+              envf.write("VALIDATION_FAILURE_ZIP=Failure_Validation.zip\n")
+          # pending list
+          path = ".pipeline-upload-zips.json"
+          zips = []
+          if os.path.isfile(path):
+              zips = list(json.load(open(path, encoding="utf-8")) or [])
+          if zip_name not in zips:
+              zips.append(zip_name)
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(zips, f)
+          PY
+          }
+
+          # Case 4: nothing valid — FAILED + Failure_Validation.zip only
+          if [ "${SKIP_PLAYWRIGHT}" = "true" ]; then
+            echo "❌ No valid suites/testcases to execute — packaging Failure_Validation.zip"
+            write_final_validation_execution_result 0 false
+            package_validation_failure_zip
+            echo "TEST_EXIT_CODE=1" >> "$GITHUB_ENV"
+            echo "exit_code=1" >> "$GITHUB_OUTPUT"
+            echo "::warning::Validation-only failure — Playwright skipped; Failure_Validation.zip will be uploaded"
+            exit 0
+          fi
+
+          if [ "${TEST_CASE_REQUEST_TYPE}" = "IMPORTED" ]; then
+            echo "🧪 IMPORT Execute — customer Playwright project"
+
+            package_imported_playwright_results() {
+              local suite_dir="$1"
+              local zip_name="$2"
+              echo "📦 IMPORT packaging → results/ (+ metadata) from Playwright output"
+              echo "📁 Creating IMPORT package directory: ${suite_dir}"
+              mkdir -p "${suite_dir}/results"
+
+              echo "----- IMPORT packaging source probe -----"
+              ls -la reports/default 2>/dev/null || echo "(no reports/default)"
+              ls -la results 2>/dev/null || echo "(no results/)"
+              ls -la test-results 2>/dev/null || echo "(no test-results/)"
+              ls -la playwright-report 2>/dev/null || echo "(no playwright-report/)"
+
+              if [ -f "results/result.json" ] && [ -d "results" ]; then
+                echo "✅ Using existing local-style results/ as-is"
+                rm -rf "${suite_dir}/results"
+                cp -a results "${suite_dir}/results"
+              elif [ -f "reports/default/results.json" ]; then
+                echo "✅ Using reports/default/results.json as result source of truth"
+                cp "reports/default/results.json" "${suite_dir}/results/result.json"
+
+                if [ -d "reports/default/artifacts" ]; then
+                  cp -a "reports/default/artifacts" "${suite_dir}/results/artifacts"
+                elif [ -d "test-results" ]; then
+                  cp -a "test-results" "${suite_dir}/results/artifacts"
+                fi
+
+                if [ -d "reports/default/html-report" ]; then
+                  cp -a "reports/default/html-report" "${suite_dir}/results/html-report"
+                elif [ -d "playwright-report" ]; then
+                  cp -a "playwright-report" "${suite_dir}/results/html-report"
+                elif [ -d "reports/default/html" ]; then
+                  cp -a "reports/default/html" "${suite_dir}/results/html-report"
+                fi
+
+                if [ -f "reports/default/junit.xml" ]; then
+                  cp "reports/default/junit.xml" "${suite_dir}/results/junit.xml"
+                elif [ -f "junit.xml" ]; then
+                  cp "junit.xml" "${suite_dir}/results/junit.xml"
+                else
+                  JUNIT=$(find . -maxdepth 5 -type f -name "junit.xml" ! -path "./${suite_dir}/*" 2>/dev/null | head -n 1)
+                  if [ -n "$JUNIT" ]; then
+                    cp "$JUNIT" "${suite_dir}/results/junit.xml"
+                  fi
+                fi
+
+                for f in reports/default/*; do
+                  [ -e "$f" ] || continue
+                  base=$(basename "$f")
+                  case "$base" in
+                    results.json|artifacts|html-report|html|junit.xml) continue ;;
+                  esac
+                  if [ -d "$f" ]; then
+                    cp -a "$f" "${suite_dir}/results/$base"
+                  elif [ -f "$f" ]; then
+                    cp "$f" "${suite_dir}/results/$base"
+                  fi
+                done
+              else
+                echo "ERROR: No results/result.json and no reports/default/results.json"
+                find . -type f \( -name "result.json" -o -name "results.json" \) -print 2>/dev/null | head -50 || true
+                return 1
+              fi
+
+              if [ ! -f "${suite_dir}/results/result.json" ]; then
+                echo "ERROR: ${suite_dir}/results/result.json missing after packaging assemble"
+                return 1
+              fi
+
+              cp "${METADATA_FILE}" "${suite_dir}/" 2>/dev/null || true
+              cp test_status*.json "${suite_dir}/" 2>/dev/null || true
+
+              echo "----- ZIP contents preview -----"
+              find "${suite_dir}" -maxdepth 4 -print 2>/dev/null || true
+
+              command -v zip >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq zip; }
+              zip -r -q -6 "${zip_name}" "${suite_dir}"
+              if [ ! -f "${zip_name}" ]; then
+                echo "❌ Failed to create zip: ${zip_name}"
+                return 1
+              fi
+              echo "✅ IMPORT zip created: ${zip_name}"
+              ls -lh "${zip_name}"
+              rm -rf "${suite_dir}"
+              echo "✅ Cleaned up temporary directory: ${suite_dir}"
+              add_pending_upload_zip "${zip_name}"
+              return 0
+            }
+
+            DATETIME=$(date +'%Y%m%d_%H%M%S')
+            eval "$(python3 - <<'PY'
+          import json, os
+          path = ".pipeline-filtered-suite-testcase.json"
+          if os.path.isfile(path):
+              data = json.load(open(path, encoding="utf-8"))
+          else:
+              data = json.loads(os.environ["SUITE_TESTCASE"])
+          names = list(data.keys())
+          label = names[0] if len(names) == 1 else "-".join(names)
+          print(f'LABEL="{label}"')
+          PY
+          )"
+            SUITE_DIR="${LABEL}_${DATETIME}"
+            ZIP_NAME="${LABEL}_${DATETIME}.zip"
+            {
+              echo "SUITE_DIR=${SUITE_DIR}"
+              echo "ZIP_NAME=${ZIP_NAME}"
+            } >> "$GITHUB_ENV"
+
+            echo "🧪 IMPORT using filtered suite/testcase map (invalid suites/testcases excluded)"
+            echo "🧪 IMPORT running suites: $(python3 -c 'import json; d=json.load(open(".pipeline-filtered-suite-testcase.json")); print(", ".join(d.keys()))')"
+
+            python3 - <<'PY'
+          import json, os, glob, subprocess, re
+
+          with open(".pipeline-filtered-suite-testcase.json", encoding="utf-8") as f:
+              filtered = json.load(f)
+          with open(os.environ.get("SUITE_PATH_MAP_FILE", ".suite-path-map.json"), encoding="utf-8") as f:
+              suite_map = json.load(f)
+
+          def resolve(name):
+              path = suite_map.get(name)
+              if path is None:
+                  return None
+              if isinstance(path, list):
+                  return path[0] if len(path) == 1 else None
+              return path if os.path.isdir(path) else None
+
+          def find_spec(suite_dir, name):
+              base = name.split("/")[-1]
+              matches = [m for m in glob.glob(os.path.join(suite_dir, "**", base), recursive=True) if os.path.isfile(m)]
+              return matches[0] if matches else None
+
+          def list_title_files(suite_dir):
+              pw = "./node_modules/.bin/playwright" if os.path.isfile("./node_modules/.bin/playwright") else "npx playwright"
+              browser = os.environ.get("BROWSER", "")
+              environment = os.environ.get("ENVIRONMENT", "")
+              cmd = f"npx cross-env BROWSER='{browser}' ENV='{environment}' {pw} test '{suite_dir}' --list"
+              print(f"🔎 IMPORT resolving specs under {suite_dir}: {cmd}")
+              try:
+                  out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, text=True)
+              except subprocess.CalledProcessError as e:
+                  out = e.output or ""
+              title_to_files = {}
+              for line in out.splitlines():
+                  trimmed = line.strip()
+                  if not trimmed or "›" not in trimmed:
+                      continue
+                  if trimmed.startswith("Listing") or trimmed.startswith("Total:"):
+                      continue
+                  parts = trimmed.split("›")
+                  if len(parts) < 3:
+                      continue
+                  loc = parts[1].strip()
+                  file_path = re.sub(r":\d+:\d+\s*$", "", loc).strip()
+                  leaf = parts[-1].strip()
+                  if not file_path or not leaf:
+                      continue
+                  title_to_files.setdefault(leaf, [])
+                  if file_path not in title_to_files[leaf]:
+                      title_to_files[leaf].append(file_path)
+              return title_to_files
+
+          def escape_grep(s):
+              for c in ["\\", ".", "^", "+", "*", "?", "(", ")", "[", "]", "{", "}", "|", "$"]:
+                  s = s.replace(c, "\\" + c)
+              return s
+
+          test_paths = []
+          grep_titles = []
+          any_all = False
+          any_title = False
+
+          for suite_name, testcases in filtered.items():
+              suite_path = resolve(suite_name)
+              if not suite_path:
+                  print(f"⚠️ IMPORT suite path not resolvable for '{suite_name}' — skipping")
+                  continue
+              tc_list = [n.strip() for n in testcases if isinstance(n, str) and n.strip()]
+              if "all" in tc_list:
+                  any_all = True
+                  if suite_path not in test_paths:
+                      test_paths.append(suite_path)
+                  print(f"🧪 IMPORT suite '{suite_name}' mode=all → {suite_path}")
+                  continue
+              if not tc_list:
+                  continue
+              spec_names = [n for n in tc_list if n.endswith(".spec.ts")]
+              titles = [n for n in tc_list if not n.endswith(".spec.ts")]
+              for name in spec_names:
+                  found = find_spec(suite_path, name)
+                  if found:
+                      if found not in test_paths:
+                          test_paths.append(found)
+                      print(f"✅ IMPORT Execute file: {found}")
+                  else:
+                      print(f"⚠️ IMPORT Spec missing at execute time (skipped): {name}")
+              if titles:
+                  any_title = True
+                  mapping = list_title_files(suite_path)
+                  resolved = []
+                  for title in titles:
+                      files = mapping.get(title) or []
+                      if not files:
+                          print(f"⚠️ IMPORT: title '{title}' not found in --list under {suite_path}")
+                          continue
+                      if title not in grep_titles:
+                          grep_titles.append(title)
+                      for file_path in files:
+                          if file_path not in test_paths:
+                              test_paths.append(file_path)
+                          if file_path not in resolved:
+                              resolved.append(file_path)
+                  print(f"🧪 IMPORT suite '{suite_name}' titles={titles} → specs={resolved}")
+
+          grep_arg = ""
+          if any_title and not any_all and grep_titles:
+              grep_arg = "|".join(escape_grep(t) for t in grep_titles)
+
+          plan = {"testPaths": test_paths, "grep": grep_arg, "anyAll": any_all, "anyTitle": any_title}
+          with open("/tmp/import_pw_plan.json", "w", encoding="utf-8") as f:
+              json.dump(plan, f)
+          with open("/tmp/import_pw_paths.txt", "w", encoding="utf-8") as f:
+              f.write("\n".join(test_paths))
+              if test_paths:
+                  f.write("\n")
+          with open("/tmp/import_pw_grep.txt", "w", encoding="utf-8") as f:
+              f.write(grep_arg)
+          print(f"🧪 IMPORT plan paths={len(test_paths)} grep={grep_arg!r}")
+          PY
+
+            PATH_COUNT=$(python3 -c 'import json; print(len(json.load(open("/tmp/import_pw_plan.json")).get("testPaths") or []))')
+            if [ "${PATH_COUNT}" = "0" ]; then
+              echo "⚠️ IMPORT: no resolvable suite/spec paths — skipping Playwright"
+              write_final_validation_execution_result 1 true
+              echo "TEST_EXIT_CODE=1" >> "$GITHUB_ENV"
+              echo "exit_code=1" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            mapfile -t IMPORT_PATH_ARR < /tmp/import_pw_paths.txt
+            TITLE_GREP=$(cat /tmp/import_pw_grep.txt 2>/dev/null || true)
+            export ENV="${ENVIRONMENT}"
+            export PATH="${GITHUB_WORKSPACE}/node_modules/.bin:${PATH}"
+            echo "🧪 IMPORT: npx cross-env BROWSER=${BROWSER} ENV=${ENVIRONMENT} playwright test ${IMPORT_PATH_ARR[*]} ${TITLE_GREP:+-g ${TITLE_GREP}} ${WORKERS:+--workers=${WORKERS}}"
+
+            (
+              while true; do
+                sleep 60
+                echo "⏳ [$(date +%H:%M:%S)] Tests still running... (This message appears every 60 seconds)"
+                if pgrep -f "playwright" > /dev/null 2>&1; then
+                  echo "   ✓ Playwright processes detected"
+                else
+                  echo "   ⚠️ No Playwright processes found"
+                fi
+              done
+            ) &
+            LOG_PID=$!
+
+            set +e
+            if [ -n "$TITLE_GREP" ]; then
+              timeout 5400 npx cross-env \
+                BROWSER="${BROWSER}" \
+                ENV="${ENVIRONMENT}" \
+                playwright test \
+                "${IMPORT_PATH_ARR[@]}" \
+                -g "${TITLE_GREP}" \
+                ${WORKERS:+--workers=$WORKERS}
+            else
+              timeout 5400 npx cross-env \
+                BROWSER="${BROWSER}" \
+                ENV="${ENVIRONMENT}" \
+                playwright test \
+                "${IMPORT_PATH_ARR[@]}" \
+                ${WORKERS:+--workers=$WORKERS}
+            fi
+            OVERALL_EXIT=$?
+            export OVERALL_EXIT
+            set -e
+            kill "$LOG_PID" 2>/dev/null || true
+            wait "$LOG_PID" 2>/dev/null || true
+
+            echo "📟 IMPORT Playwright exit code: ${OVERALL_EXIT}"
+
+            echo "===== IMPORT TEMP DIAGNOSTICS START ====="
+            echo "Exit code: ${OVERALL_EXIT}"
+            pwd
+            ls -la playwright.config.* 2>/dev/null || echo "(no playwright.config.* at workspace root)"
+            find . -maxdepth 5 -type d \( -name "results" -o -name "test-results" -o -name "playwright-report" -o -name "reports" \) 2>/dev/null | sort || true
+            find . -maxdepth 7 -type f \( -name "result.json" -o -name "results.json" -o -name "junit.xml" \) 2>/dev/null | sort || true
+            echo "===== IMPORT TEMP DIAGNOSTICS END ====="
+
+            python3 - <<'PY'
+          import json, os, datetime
+          suites = json.load(open(".pipeline-filtered-suite-testcase.json", encoding="utf-8")).keys()
+          exit_code = int(os.environ.get("OVERALL_EXIT", "1"))
+          for suite in suites:
+              payload = {
+                  "suite": suite,
+                  "test_exit_code": exit_code,
+                  "test_status": "PASSED" if exit_code == 0 else "FAILED",
+                  "tests_executed_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              }
+              with open(f"test_status_{suite}.json", "w", encoding="utf-8") as f:
+                  json.dump(payload, f, indent=4)
+          PY
+
+            echo "IMPORT test exit code: ${OVERALL_EXIT}"
+            echo "TEST_EXIT_CODE=${OVERALL_EXIT}" >> "$GITHUB_ENV"
+            echo "exit_code=${OVERALL_EXIT}" >> "$GITHUB_OUTPUT"
+
+            write_final_validation_execution_result "$OVERALL_EXIT" true
+
+            python3 - <<'PY'
+          import json, os
+          candidates = ["results/result.json", "reports/default/results.json"]
+          total = passed = failed = skipped = 0
+          for path in candidates:
+              if not os.path.isfile(path):
+                  continue
+              try:
+                  stats = (json.load(open(path, encoding="utf-8")).get("stats") or {})
+                  expected = int(stats.get("expected") or 0)
+                  unexpected = int(stats.get("unexpected") or 0)
+                  sk = int(stats.get("skipped") or 0)
+                  passed += expected
+                  failed += unexpected
+                  skipped += sk
+                  total += expected + unexpected + sk
+                  break
+              except Exception as e:
+                  print(f"⚠️ Could not read stats from {path}: {e}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
+              envf.write(f"TEST_TOTAL={total}\n")
+              envf.write(f"TEST_PASSED={passed}\n")
+              envf.write(f"TEST_FAILED={failed}\n")
+              envf.write(f"TEST_SKIPPED={skipped}\n")
+          print(f"📊 Aggregated: total={total} passed={passed} failed={failed} skipped={skipped}")
+          PY
+
+            set +e
+            package_imported_playwright_results "${SUITE_DIR}" "${ZIP_NAME}"
+            PKG_RC=$?
+            set -e
+            if [ "$PKG_RC" -ne 0 ]; then
+              echo "⚠️ IMPORT packageImportedPlaywrightResults failed"
+              python3 .pipeline-write-er.py FAILED "Execute Tests" ZIP_CREATION_FAILED "Zip packaging failed: ${ZIP_NAME}" || true
+              echo "📦 IMPORT fallback packaging: ${ZIP_NAME}"
+              mkdir -p "${SUITE_DIR}/results"
+              cp "${METADATA_FILE}" "${SUITE_DIR}/" 2>/dev/null || true
+              cp test_status*.json "${SUITE_DIR}/" 2>/dev/null || true
+              if [ -f "results/result.json" ] && [ -d "results" ]; then
+                rm -rf "${SUITE_DIR}/results"
+                cp -a results "${SUITE_DIR}/results"
+              elif [ -f "reports/default/results.json" ]; then
+                cp "reports/default/results.json" "${SUITE_DIR}/results/result.json"
+                [ -d "reports/default/artifacts" ] && cp -a "reports/default/artifacts" "${SUITE_DIR}/results/artifacts"
+                [ -d "test-results" ] && [ ! -d "${SUITE_DIR}/results/artifacts" ] && cp -a "test-results" "${SUITE_DIR}/results/artifacts"
+                [ -d "reports/default/html-report" ] && cp -a "reports/default/html-report" "${SUITE_DIR}/results/html-report"
+                [ -d "playwright-report" ] && [ ! -d "${SUITE_DIR}/results/html-report" ] && cp -a "playwright-report" "${SUITE_DIR}/results/html-report"
+                [ -f "reports/default/junit.xml" ] && cp "reports/default/junit.xml" "${SUITE_DIR}/results/junit.xml"
+              fi
+              command -v zip >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq zip; }
+              zip -r -q -6 "${ZIP_NAME}" "${SUITE_DIR}" || true
+              rm -rf "${SUITE_DIR}"
+              ls -lh "${ZIP_NAME}" 2>/dev/null || true
+              if [ -f "${ZIP_NAME}" ]; then
+                add_pending_upload_zip "${ZIP_NAME}"
+                echo "✅ IMPORT fallback ZIP ready: ${ZIP_NAME}"
+              else
+                echo "❌ IMPORT fallback ZIP was not created"
+                python3 .pipeline-write-er.py FAILED "Execute Tests" ZIP_CREATION_FAILED "Zip packaging failed: ${ZIP_NAME}" || true
+              fi
+            fi
+
+            if [ "$OVERALL_EXIT" -ne 0 ]; then
+              echo "⚠️ IMPORT tests failed - marking build as UNSTABLE (artifacts preserved for S3 upload)"
+              echo "::warning::Playwright tests failed (TEST_EXIT_CODE=${OVERALL_EXIT}). Packaging and S3 upload will continue."
+            elif [ "${PARTIAL_TESTCASES}" = "true" ] || [ "${HAS_INVALID_SUITES}" = "true" ]; then
+              echo "⚠️ IMPORT PARTIAL_FAILED — single execution ZIP uploaded (validation details in metadata.json)"
+            else
+              echo "✅ IMPORT tests passed"
+            fi
+            exit 0
+          fi
+
+          case "$BROWSER" in
+            chrome|chromium) PLAYWRIGHT_PROJECT="chromium" ;;
+            firefox) PLAYWRIGHT_PROJECT="firefox" ;;
+            webkit) PLAYWRIGHT_PROJECT="webkit" ;;
+            *) PLAYWRIGHT_PROJECT="$BROWSER" ;;
+          esac
+
+          DATETIME=$(date +'%Y%m%d_%H%M%S')
+          eval "$(python3 - <<'PY'
+          import json, os
+          path = ".pipeline-filtered-suite-testcase.json"
+          if os.path.isfile(path):
+              data = json.load(open(path, encoding="utf-8"))
+          else:
+              data = json.loads(os.environ["SUITE_TESTCASE"])
+          names = list(data.keys())
+          label = names[0] if len(names) == 1 else "-".join(names)
+          print(f'LABEL="{label}"')
+          PY
+          )"
+          SUITE_DIR="${LABEL}_${DATETIME}"
+          ZIP_NAME="${LABEL}_${DATETIME}.zip"
+          {
+            echo "SUITE_DIR=${SUITE_DIR}"
+            echo "ZIP_NAME=${ZIP_NAME}"
+            echo "PLAYWRIGHT_PROJECT=${PLAYWRIGHT_PROJECT}"
+          } >> "$GITHUB_ENV"
+
+          echo "🧪 Using filtered suite_testcase (invalid suites/specs excluded)"
+          echo "🧪 Running suites: $(python3 -c 'import json,os; d=json.load(open(".pipeline-filtered-suite-testcase.json")); print(", ".join(d.keys()))')"
+
+          OVERALL_EXIT=0
+          FIRST=1
+          : > /tmp/test_failure_summary.txt
+
+          python3 - <<'PY' > /tmp/suite_order.txt
+          import json
+          for suite in json.load(open(".pipeline-filtered-suite-testcase.json", encoding="utf-8")).keys():
+              print(suite)
+          PY
+
+          set +e
+
+          while IFS= read -r SUITE; do
+            [ -z "$SUITE" ] && continue
+            if [ "$FIRST" -eq 0 ]; then
+              rm -rf test-results playwright-report
+              echo "🧹 Cleared test-results/ and playwright-report/ for next suite"
+            fi
+            FIRST=0
+
+            echo "🧪 Running suite: ${SUITE}"
+            export SUITE
+
+            # buildPlaywrightTestPaths → /tmp/pw_plan.json
+            python3 - <<'PY'
+          import json, os, glob, subprocess
+
+          suite = os.environ["SUITE"]
+          with open(".pipeline-filtered-suite-testcase.json", encoding="utf-8") as f:
+              filtered = json.load(f)
+          with open(os.environ.get("SUITE_PATH_MAP_FILE", ".suite-path-map.json"), encoding="utf-8") as f:
+              suite_map = json.load(f)
+
+          def resolve(suite):
+              path = suite_map[suite]
+              if isinstance(path, list):
+                  if len(path) != 1:
+                      raise SystemExit(f"Ambiguous suite '{suite}': {path}")
+                  path = path[0]
+              return path
+
+          def find_spec(suite_dir, name):
+              base = name.split("/")[-1]
+              matches = [m for m in glob.glob(os.path.join(suite_dir, "**", base), recursive=True) if os.path.isfile(m)]
+              return matches[0] if matches else None
+
+          suite_dir = resolve(suite)
+          testcases = filtered[suite]
+
+          if "all" in testcases:
+              specs = sorted(glob.glob(os.path.join(suite_dir, "**", "*.spec.ts"), recursive=True))
+              specs = [s for s in specs if os.path.isfile(s)]
+              if not specs:
+                  raise SystemExit(f"No .spec.ts files found under {suite_dir}")
+              plan = {"suiteDir": suite_dir, "filePaths": specs, "titleGrep": "", "skip": False}
+          else:
+              names = [n.strip() for n in testcases if isinstance(n, str) and n.strip()]
+              if not names:
+                  plan = {"suiteDir": suite_dir, "filePaths": [], "titleGrep": "", "skip": True}
+              else:
+                  file_paths = []
+                  titles = []
+                  for name in names:
+                      if name.endswith(".spec.ts"):
+                          found = find_spec(suite_dir, name)
+                          if found:
+                              file_paths.append(found)
+                              print(f"✅ Execute file: {found}")
+                          else:
+                              print(f"⚠️ Spec missing at execute time (skipped): {name}")
+                      else:
+                          titles.append(name)
+                          print(f"✅ Execute title: {name}")
+                  title_grep = "|".join(titles) if titles else ""
+                  if not file_paths and not title_grep:
+                      plan = {"suiteDir": suite_dir, "filePaths": [], "titleGrep": "", "skip": True}
+                  else:
+                      print(f"🔎 Plan suite='{suite}' files={len(file_paths)} titles={len(titles)} grep=\"{title_grep}\"")
+                      plan = {"suiteDir": suite_dir, "filePaths": file_paths, "titleGrep": title_grep, "skip": False}
+
+          with open("/tmp/pw_plan.json", "w", encoding="utf-8") as f:
+              json.dump(plan, f)
+          PY
+            PLAN_RC=$?
+            if [ "$PLAN_RC" -ne 0 ]; then
+              echo "::error::Failed to build Playwright plan for suite '${SUITE}'"
+              EXIT_CODE=1
+              OVERALL_EXIT=1
+              echo "suite=${SUITE} exit=1 reason=plan_resolution" >> /tmp/test_failure_summary.txt
+              continue
+            fi
+
+            run_playwright_once() {
+              local paths_arg="$1"
+              local grep_pattern="$2"
+              local grep_arg=""
+              if [ -n "$grep_pattern" ]; then
+                grep_arg="--grep ${grep_pattern}"
+              fi
+              echo "📂 Playwright paths: ${paths_arg}"
+              echo "🌐 Project: ${PLAYWRIGHT_PROJECT}  workers: ${WORKERS:-default}  grep: ${grep_pattern:-<none>}"
+
+              (
+                while true; do
+                  sleep 60
+                  echo "⏳ [$(date +%H:%M:%S)] Tests still running... (This message appears every 60 seconds)"
+                  if pgrep -f "playwright" > /dev/null 2>&1; then
+                    echo "   ✓ Playwright processes detected"
+                  else
+                    echo "   ⚠️ No Playwright processes found"
+                  fi
+                done
+              ) &
+              LOG_PID=$!
+
+              if [ -n "$grep_pattern" ]; then
+                timeout 5400 env \
+                  SUITE="$SUITE" \
+                  BROWSER="$BROWSER" \
+                  IS_REGRESSION=false \
+                  ./node_modules/.bin/playwright test \
+                  $paths_arg \
+                  --grep "$grep_pattern" \
+                  --project="$PLAYWRIGHT_PROJECT" \
+                  ${WORKERS:+--workers=$WORKERS}
+              else
+                timeout 5400 env \
+                  SUITE="$SUITE" \
+                  BROWSER="$BROWSER" \
+                  IS_REGRESSION=false \
+                  ./node_modules/.bin/playwright test \
+                  $paths_arg \
+                  --project="$PLAYWRIGHT_PROJECT" \
+                  ${WORKERS:+--workers=$WORKERS}
+              fi
+              local raw=$?
+              kill "$LOG_PID" 2>/dev/null || true
+              wait "$LOG_PID" 2>/dev/null || true
+              echo "📟 Playwright process exit code (raw): ${raw}"
+              return $raw
+            }
+
+            reconcile_exit() {
+              local raw="$1"
+              RAW_EXIT="$raw" python3 - <<'PY'
+          import json, os, sys
+          raw = int(os.environ.get("RAW_EXIT", "1"))
+          results_path = "test-results/results.json"
+          if not os.path.isfile(results_path):
+              print(raw)
+              sys.exit(0)
+          with open(results_path, encoding="utf-8") as f:
+              report = json.load(f)
+          stats = report.get("stats") or {}
+          expected = int(stats.get("expected") or 0)
+          unexpected = int(stats.get("unexpected") or 0)
+          flaky = int(stats.get("flaky") or 0)
+          skipped = int(stats.get("skipped") or 0)
+          print(f"📊 results.json stats: expected={expected} unexpected={unexpected} flaky={flaky} skipped={skipped}", file=sys.stderr)
+          if unexpected > 0:
+              print(1); sys.exit(0)
+          if expected > 0 and unexpected == 0:
+              if raw != 0:
+                  print(f"⚠️ Process exit was {raw} but results.json shows all tests passed — treating suite as PASSED", file=sys.stderr)
+              print(0); sys.exit(0)
+          print(raw)
+          PY
+            }
+
+            SKIP=$(python3 -c 'import json; print("true" if json.load(open("/tmp/pw_plan.json")).get("skip") else "false")')
+            EXIT_CODE=0
+
+            if [ "$SKIP" = "true" ]; then
+              echo "⏭️ Skipping Playwright for suite '${SUITE}' (no runnable paths/titles)"
+              mkdir -p test-results playwright-report
+              echo '{"suites":[]}' > test-results/results.json
+              EXIT_CODE=0
+            else
+              FILE_PATHS=$(python3 -c 'import json; print(" ".join(json.load(open("/tmp/pw_plan.json")).get("filePaths") or []))')
+              TITLE_GREP=$(python3 -c 'import json; print(json.load(open("/tmp/pw_plan.json")).get("titleGrep") or "")')
+              SUITE_PATH=$(python3 -c 'import json; print(json.load(open("/tmp/pw_plan.json")).get("suiteDir") or "")')
+              RAN_FILES=0
+
+              if [ -n "$FILE_PATHS" ]; then
+                echo "🧪 Suite '${SUITE}' — running spec file(s)"
+                run_playwright_once "$FILE_PATHS" ""
+                FILE_RAW=$?
+                FILE_EXIT=$(reconcile_exit "$FILE_RAW")
+                if [ "$FILE_EXIT" -ne 0 ]; then EXIT_CODE=$FILE_EXIT; fi
+                RAN_FILES=1
+                if [ -n "$TITLE_GREP" ]; then
+                  mkdir -p "reports/${SUITE}/_run_files"
+                  [ -f test-results/results.json ] && cp test-results/results.json "reports/${SUITE}/_run_files/results.json"
+                  [ -d test-results ] && rm -rf "reports/${SUITE}/_run_files/test-results" && cp -r test-results "reports/${SUITE}/_run_files/test-results"
+                  [ -d playwright-report ] && rm -rf "reports/${SUITE}/_run_files/html-report" && cp -r playwright-report "reports/${SUITE}/_run_files/html-report"
+                  rm -rf test-results playwright-report
+                fi
+              fi
+
+              if [ -n "$TITLE_GREP" ]; then
+                echo "🧪 Suite '${SUITE}' — running titles via --grep \"${TITLE_GREP}\""
+                run_playwright_once "$SUITE_PATH" "$TITLE_GREP"
+                TITLE_RAW=$?
+                TITLE_EXIT=$(reconcile_exit "$TITLE_RAW")
+                if [ "$TITLE_EXIT" -ne 0 ]; then EXIT_CODE=$TITLE_EXIT; fi
+                if [ "$RAN_FILES" -eq 1 ] && [ -f "reports/${SUITE}/_run_files/results.json" ]; then
+                  mkdir -p test-results
+                  if [ -f test-results/results.json ] && [ -f "reports/${SUITE}/_run_files/results.json" ]; then
+                    node -e '
+                      const fs = require("fs");
+                      const a = JSON.parse(fs.readFileSync("reports/'"${SUITE}"'/_run_files/results.json", "utf8"));
+                      const b = JSON.parse(fs.readFileSync("test-results/results.json", "utf8"));
+                      const out = Object.assign({}, b);
+                      out.suites = [].concat(a.suites || [], b.suites || []);
+                      fs.writeFileSync("test-results/results.json", JSON.stringify(out, null, 2));
+                    '
+                  elif [ -f "reports/${SUITE}/_run_files/results.json" ]; then
+                    cp "reports/${SUITE}/_run_files/results.json" test-results/results.json
+                  fi
+                fi
+              fi
+            fi
+
+            export EXIT_CODE
+            echo "📟 Suite '${SUITE}' reconciled exit code: ${EXIT_CODE}"
+
+            python3 - <<'PY'
+          import json, os, sys
+
+          suite = os.environ["SUITE"]
+          exit_code = int(os.environ["EXIT_CODE"])
+          results_path = "test-results/results.json"
+          summary_path = "/tmp/test_failure_summary.txt"
+
+          def walk(nodes, prefix=""):
+              for node in nodes or []:
+                  title = node.get("title") or node.get("file") or ""
+                  name = f"{prefix} › {title}" if prefix and title else (title or prefix)
+                  for spec in node.get("specs") or []:
+                      spec_title = spec.get("title") or ""
+                      full = f"{name} › {spec_title}" if name else spec_title
+                      for t in spec.get("tests") or []:
+                          for r in t.get("results") or []:
+                              if r.get("status") in ("failed", "timedOut", "interrupted"):
+                                  err = ""
+                                  for e in r.get("errors") or []:
+                                      err = (e.get("message") or str(e) or "").strip()
+                                      if err:
+                                          break
+                                  yield full, err or r.get("status")
+                  yield from walk(node.get("suites") or [], name)
+
+          if exit_code != 0:
+              print(f"::warning::Suite '{suite}' FAILED (exit code {exit_code})")
+              with open(summary_path, "a", encoding="utf-8") as sf:
+                  sf.write(f"suite={suite} exit={exit_code}\n")
+              if os.path.isfile(results_path):
+                  with open(results_path, encoding="utf-8") as f:
+                      report = json.load(f)
+                  failures = list(walk(report.get("suites") or []))
+                  if not failures:
+                      print(f"::warning::Suite '{suite}' failed but no per-test failures found in results.json (infra/config/timeout?)")
+                      with open(summary_path, "a", encoding="utf-8") as sf:
+                          sf.write(f"  reason=no_per_test_failure_in_results_json raw_check_logs\n")
+                  for title, err in failures:
+                      msg = f"FAILED: {title}"
+                      if err:
+                          first = err.splitlines()[0][:300]
+                          msg = f"{msg} — {first}"
+                      print(f"::warning::{msg}")
+                      with open(summary_path, "a", encoding="utf-8") as sf:
+                          sf.write(f"  {msg}\n")
+              else:
+                  print(f"::warning::Suite '{suite}' failed and test-results/results.json is missing")
+                  with open(summary_path, "a", encoding="utf-8") as sf:
+                      sf.write(f"  reason=missing_results_json\n")
+          else:
+              print(f"✅ Suite '{suite}' PASSED")
+          PY
+
+            echo "===== Checking Playwright Reports ====="
+            find . -name "results.json" || true
+            ls -R test-results || true
+            ls -R playwright-report || true
+
+            python3 - <<'PY'
+          import json, os, datetime
+          suite = os.environ["SUITE"]
+          exit_code = int(os.environ["EXIT_CODE"])
+          payload = {
+              "suite": suite,
+              "test_exit_code": exit_code,
+              "test_status": "PASSED" if exit_code == 0 else "FAILED",
+              "tests_executed_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          with open(f"test_status_{suite}.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=4)
+          PY
+
+            if [ -f "test-results/results.json" ]; then
+              node <<'NODE'
+          const fs = require('fs');
+          const resultsPath = 'test-results/results.json';
+          const report = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
+          const suites = Array.isArray(report.suites) ? report.suites : [];
+          const groups = new Map();
+          function groupKeyFromFile(file) {
+            if (!file) return 'unknown';
+            const slash = file.indexOf('/');
+            if (slash === -1) {
+              return file.replace(/\.[^/.]+$/, '') || file;
+            }
+            return file.slice(0, slash);
+          }
+          for (const suite of suites) {
+            const key = groupKeyFromFile(suite.file || '');
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(Object.assign({}, suite, { title: suite.title || key }));
+          }
+          report.suites = Array.from(groups.entries()).map(([key, children]) => ({
+            title: key,
+            file: key,
+            suites: children,
+          }));
+          fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
+          NODE
+              echo "✅ Transformed results.json suite hierarchy"
+            fi
+
+            mkdir -p "reports/${SUITE}"
+            if [ -f "test-results/results.json" ]; then
+              cp "test-results/results.json" "reports/${SUITE}/results.json"
+            else
+              echo "⚠️ No results.json found for suite '${SUITE}'"
+            fi
+            if [ -d "test-results" ]; then
+              rm -rf "reports/${SUITE}/test-results"
+              cp -r test-results "reports/${SUITE}/test-results"
+            fi
+            if [ -d "playwright-report" ]; then
+              rm -rf "reports/${SUITE}/html-report"
+              cp -r playwright-report "reports/${SUITE}/html-report"
+            fi
+            echo "✅ Preserved suite artifacts → reports/${SUITE}/"
+
+            if [ "$EXIT_CODE" -ne 0 ]; then
+              OVERALL_EXIT=$EXIT_CODE
+            fi
+          done < /tmp/suite_order.txt
+
+          echo "Test exit code: ${OVERALL_EXIT}"
+          echo "TEST_EXIT_CODE=${OVERALL_EXIT}" >> "$GITHUB_ENV"
+          echo "exit_code=${OVERALL_EXIT}" >> "$GITHUB_OUTPUT"
+
+          # Final executionResult BEFORE packaging (Jenkins writeFinalValidationExecutionResult)
+          write_final_validation_execution_result "$OVERALL_EXIT" true
+
+          python3 - <<'PY'
+          import json, os, glob
+
+          total = passed = failed = skipped = 0
+          for path in glob.glob("reports/*/results.json"):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      stats = (json.load(f).get("stats") or {})
+                  expected = int(stats.get("expected") or 0)
+                  unexpected = int(stats.get("unexpected") or 0)
+                  sk = int(stats.get("skipped") or 0)
+                  passed += expected
+                  failed += unexpected
+                  skipped += sk
+                  total += expected + unexpected + sk
+              except Exception as e:
+                  print(f"⚠️ Could not read stats from {path}: {e}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
+              envf.write(f"TEST_TOTAL={total}\n")
+              envf.write(f"TEST_PASSED={passed}\n")
+              envf.write(f"TEST_FAILED={failed}\n")
+              envf.write(f"TEST_SKIPPED={skipped}\n")
+          print(f"📊 Aggregated: total={total} passed={passed} failed={failed} skipped={skipped}")
+          PY
+
+          if [ -s /tmp/test_failure_summary.txt ]; then
+            echo "======== Test failure summary ========"
+            cat /tmp/test_failure_summary.txt
+            echo "======================================"
+            cp /tmp/test_failure_summary.txt test_failure_summary.txt || true
+          fi
+
+          if [ "$OVERALL_EXIT" -ne 0 ]; then
+            echo "⚠️ Tests failed — Jenkins UNSTABLE equivalent (pipeline continues; workflow stays SUCCESS)"
+            echo "::warning::Playwright tests failed (TEST_EXIT_CODE=${OVERALL_EXIT}). Packaging and S3 upload will continue."
+          elif [ "${PARTIAL_TESTCASES}" = "true" ] || [ "${HAS_INVALID_SUITES}" = "true" ]; then
+            echo "⚠️ PARTIAL_FAILED — single execution ZIP uploaded (validation details in metadata.json)"
+          else
+            echo "✅ All suites passed (TEST_EXIT_CODE=0)"
+          fi
+          # Never fail the job for test results — infra failures elsewhere still fail the workflow
+          exit 0
+
+      # 9. Package Results (packageResultsOptimized) — skipped on validation-only Failure_Validation.zip
+      - name: Package Results
+        if: success() && env.SKIP_PLAYWRIGHT != 'true' && env.ZIP_NAME != '' && env.TEST_CASE_REQUEST_TYPE != 'IMPORTED'
+        run: |
+          set -e
+          echo "📦 Packaging results..."
+          echo "   Suite directory: ${SUITE_DIR}"
+          echo "   Zip file name: ${ZIP_NAME}"
+
+          python3 - <<'PY'
+          import json, os, subprocess, shutil
+
+          filtered_path = ".pipeline-filtered-suite-testcase.json"
+          if os.path.isfile(filtered_path):
+              suite_testcase = json.load(open(filtered_path, encoding="utf-8"))
+          else:
+              suite_testcase = json.loads(os.environ.get("SUITE_TESTCASE", "{}"))
+          suites = list(suite_testcase.keys())
+          suite_dir = os.environ["SUITE_DIR"]
+          zip_name = os.environ["ZIP_NAME"]
+          metadata = os.environ["METADATA_FILE"]
+
+          os.makedirs(suite_dir, exist_ok=True)
+          found = False
+          for suite in suites:
+              src = os.path.join("reports", suite)
+              dst = os.path.join(suite_dir, suite)
+              if not os.path.isdir(src):
+                  continue
+              os.makedirs(dst, exist_ok=True)
+              results = os.path.join(src, "results.json")
+              if os.path.isfile(results):
+                  shutil.copy2(results, os.path.join(dst, "results.json"))
+                  found = True
+              html = os.path.join(src, "html-report")
+              if os.path.isdir(html):
+                  shutil.copytree(html, os.path.join(dst, "html-report"), dirs_exist_ok=True)
+              tr = os.path.join(src, "test-results")
+              if os.path.isdir(tr):
+                  shutil.copytree(tr, os.path.join(dst, "test-results"), dirs_exist_ok=True)
+
+          if not found:
+              raise SystemExit("ERROR: No suite results.json found under reports/")
+
+          if os.path.isfile(metadata):
+              shutil.copy2(metadata, suite_dir)
+          for name in os.listdir("."):
+              if name.startswith("test_status") and name.endswith(".json"):
+                  shutil.copy2(name, suite_dir)
+
+          rc = subprocess.call(["zip", "-r", "-q", "-6", zip_name, suite_dir])
+          if rc != 0 or not os.path.isfile(zip_name):
+              subprocess.call(["python3", ".pipeline-write-er.py", "FAILED", "Execute Tests", "ZIP_CREATION_FAILED", f"Zip packaging failed: {zip_name}"])
+              raise SystemExit(f"❌ Failed to create zip: {zip_name}")
+
+          print(f"✅ Zip created successfully: {zip_name}")
+          subprocess.call(["ls", "-lh", zip_name])
+          shutil.rmtree(suite_dir, ignore_errors=True)
+          print(f"✅ Cleaned up temporary directory: {suite_dir}")
+
+          path = ".pipeline-upload-zips.json"
+          zips = []
+          if os.path.isfile(path):
+              zips = list(json.load(open(path, encoding="utf-8")) or [])
+          if zip_name not in zips:
+              zips.append(zip_name)
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(zips, f)
+          print(f"📦 Pending upload ZIPs: {zips}")
+          PY
+
+      # 10. Upload to S3 (uploadAllPendingZips / uploadToS3Optimized)
+      - name: Upload to S3
+        if: success()
+        env:
+          AWS_ACCESS_KEY_ID_ENC: ${{ github.event.inputs.aws_access_key_id }}
+          AWS_SECRET_ACCESS_KEY_ENC: ${{ github.event.inputs.aws_secret_access_key }}
+          S3_PREFIX: ${{ github.event.inputs.s3_prefix }}
+          AWS_REGION_INPUT: ${{ github.event.inputs.aws_region }}
+        run: |
+          set -e
+
+          decrypt_value() {
+            local encrypted="$1"
+            local enc_file out_file
+            enc_file=$(mktemp)
+            out_file=$(mktemp)
+            printf '%s' "$encrypted" > "$enc_file"
+            set +x
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -a -A -in "$enc_file" -out "$out_file" -pass env:ENCRYPTION_KEY; then
+              rm -f "$enc_file" "$out_file"
+              echo "::error::OpenSSL decryption failed (invalid key or corrupt data)"
+              return 1
+            fi
+            local plaintext
+            plaintext=$(tr -d '\r\n' < "$out_file")
+            rm -f "$enc_file" "$out_file"
+            if [ -z "$plaintext" ]; then
+              echo "::error::Decrypted value is empty"
+              return 1
+            fi
+            printf '%s' "$plaintext"
+          }
+
+          if ! AWS_ACCESS_KEY_ID_VAL=$(decrypt_value "$AWS_ACCESS_KEY_ID_ENC"); then
+            python3 .pipeline-write-er.py FAILED "Upload to S3" UPLOAD_FAILED "Invalid AWS credentials. Please verify the encrypted AWS access keys." || true
+            exit 1
+          fi
+          if ! AWS_SECRET_ACCESS_KEY_VAL=$(decrypt_value "$AWS_SECRET_ACCESS_KEY_ENC"); then
+            python3 .pipeline-write-er.py FAILED "Upload to S3" UPLOAD_FAILED "Invalid AWS credentials. Please verify the encrypted AWS access keys." || true
+            exit 1
+          fi
+          AWS_REGION="${AWS_REGION_INPUT:-us-east-1}"
+
+          CREDS_FILE=".gha-aws-credentials"
+          printf '%s\n' \
+            '[default]' \
+            "aws_access_key_id = ${AWS_ACCESS_KEY_ID_VAL}" \
+            "aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY_VAL}" \
+            > "$CREDS_FILE"
+
+          PREFIX=$(echo "$S3_PREFIX" | sed -e 's|^/*||' -e 's|/*$||')
+
+          which aws || (sudo apt-get update && sudo apt-get install -y awscli)
+
+          export AWS_SHARED_CREDENTIALS_FILE="${GITHUB_WORKSPACE}/${CREDS_FILE}"
+          export AWS_DEFAULT_REGION="$AWS_REGION"
+
+          cleanup_creds() { rm -f "$CREDS_FILE"; }
+          trap cleanup_creds EXIT
+
+          # Collect pending ZIPs (Jenkins uploadAllPendingZips)
+          ZIP_LIST=$(python3 - <<'PY'
+          import json, os
+          zips = []
+          path = ".pipeline-upload-zips.json"
+          if os.path.isfile(path):
+              zips = [str(z) for z in (json.load(open(path, encoding="utf-8")) or [])]
+          zip_name = (os.environ.get("ZIP_NAME") or "").strip()
+          if zip_name and os.path.isfile(zip_name) and zip_name not in zips:
+              zips.insert(0, zip_name)
+          # Also pick Failure_Validation.zip if present
+          if os.path.isfile("Failure_Validation.zip") and "Failure_Validation.zip" not in zips:
+              zips.append("Failure_Validation.zip")
+          print("\n".join(zips))
+          PY
+          )
+
+          if [ -z "$ZIP_LIST" ]; then
+            echo "::error::No zip file specified for upload"
+            python3 .pipeline-write-er.py FAILED "Upload to S3" UPLOAD_FAILED "No zip file specified for upload" || true
+            exit 1
+          fi
+
+          echo "📤 Uploading ZIP(s) to S3:"
+          echo "$ZIP_LIST"
+
+          upload_one() {
+            local zip_file="$1"
+            if [ ! -f "$zip_file" ]; then
+              echo "::error::Zip file not found: ${zip_file}"
+              return 1
+            fi
+            if [ -n "$PREFIX" ]; then
+              S3_PATH="s3://taas-qa-ai/${PREFIX}/${zip_file}"
+            else
+              S3_PATH="s3://taas-qa-ai/${zip_file}"
+            fi
+            echo "📤 Uploading to: ${S3_PATH}"
+            for attempt in 1 2 3; do
+              set +x
+              if aws configure list && aws s3 cp "${zip_file}" "${S3_PATH}" --region "${AWS_REGION}" --only-show-errors; then
+                echo "✅ Upload successful → ${S3_PATH}"
+                echo "S3_LOCATION=${S3_PATH}" >> "$GITHUB_ENV"
+                return 0
+              fi
+              echo "⚠️ Upload attempt ${attempt} failed"
+              sleep 2
+            done
+            echo "::error::Upload failed after retries: ${zip_file}"
+            return 1
+          }
+
+          FAIL=0
+          while IFS= read -r ZIP_FILE; do
+            [ -z "$ZIP_FILE" ] && continue
+            if ! upload_one "$ZIP_FILE"; then
+              FAIL=1
+            fi
+          done <<< "$ZIP_LIST"
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::Upload failed after retries"
+            python3 .pipeline-write-er.py FAILED "Upload to S3" UPLOAD_FAILED "Upload failed after retries" || true
+            exit 1
+          fi
+
+      # 11. Archive Artifacts
+      - name: Archive Artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: taas-artifacts-${{ github.run_id }}
+          path: |
+            **/*.zip
+            metadata.json
+            test_status*.json
+            test_summary.json
+          if-no-files-found: warn
+          retention-days: 15
+
+      # Jenkins post.always — ensure executionResult exists
+      - name: Ensure executionResult
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          meta = os.environ.get("METADATA_FILE", "metadata.json")
+          has = False
+          if os.path.isfile(meta):
+              try:
+                  data = json.load(open(meta, encoding="utf-8"))
+                  has = data.get("executionResult") is not None
+              except Exception:
+                  has = False
+          if has:
+              print("✅ executionResult already present")
+              raise SystemExit(0)
+          job_status = os.environ.get("JOB_STATUS", "success")
+          if job_status == "success":
+              subprocess.call(["python3", ".pipeline-write-er.py", "SUCCESS", "Completed", "", "Execution completed successfully"])
+          else:
+              subprocess.call(["python3", ".pipeline-write-er.py", "FAILED", "Completed", "UNEXPECTED_ERROR", f"Pipeline ended with status {job_status}"])
+          PY
+        env:
+          JOB_STATUS: ${{ job.status }}
+
+      # 12. Print Execution Summary (printSummary)
+      - name: Print Execution Summary
+        if: always()
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+          BROWSER: ${{ github.event.inputs.browser }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          TEST_RUN_ID: ${{ github.event.inputs.test_run_id }}
+          S3_PREFIX: ${{ github.event.inputs.s3_prefix }}
+        run: |
+          TEST_EXIT_CODE="${TEST_EXIT_CODE:-N/A}"
+          ZIP_FILE="${ZIP_NAME:-N/A}"
+          if [ -z "$ZIP_FILE" ] || [ "$ZIP_FILE" = "" ]; then
+            if [ -f Failure_Validation.zip ]; then
+              ZIP_FILE="Failure_Validation.zip"
+            fi
+          fi
+
+          ER_STATUS=""
+          if [ -f "$METADATA_FILE" ]; then
+            ER_STATUS=$(python3 -c 'import json,os; d=json.load(open(os.environ["METADATA_FILE"])); print((d.get("executionResult") or {}).get("status") or "")' 2>/dev/null || true)
+          fi
+
+          if [ "${{ job.status }}" = "success" ]; then
+            PIPELINE_STATUS="SUCCESS"
+          else
+            PIPELINE_STATUS="FAILED"
+          fi
+
+          if [ "$ER_STATUS" = "PARTIAL_FAILED" ]; then
+            TEST_STATUS="PARTIAL_FAILED"
+          elif [ "$ER_STATUS" = "SUCCESS" ] || [ "$TEST_EXIT_CODE" = "0" ]; then
+            TEST_STATUS="PASSED"
+          elif [ "$TEST_EXIT_CODE" = "N/A" ] || [ -z "$TEST_EXIT_CODE" ]; then
+            if [ "$ER_STATUS" = "FAILED" ]; then
+              TEST_STATUS="FAILED"
+            else
+              TEST_STATUS="N/A"
+            fi
+          else
+            TEST_STATUS="FAILED"
+          fi
+
+          S3_LOCATION="${S3_LOCATION:-N/A}"
+          if [ "$S3_LOCATION" = "N/A" ] && [ "$ZIP_FILE" != "N/A" ]; then
+            PREFIX=$(echo "$S3_PREFIX" | sed -e 's|^/*|/|' -e 's|/*$||')
+            S3_LOCATION="s3://taas-qa-ai${PREFIX}/${ZIP_FILE}"
+          fi
+
+          TOTAL="${TEST_TOTAL:-N/A}"
+          PASSED="${TEST_PASSED:-N/A}"
+          FAILED="${TEST_FAILED:-N/A}"
+          SKIPPED="${TEST_SKIPPED:-N/A}"
+
+          cat <<EOF
+          ==================================================
+          TaaS Execution Summary
+          ==================================================
+
+          Pipeline Status : ${PIPELINE_STATUS}
+          Test Status     : ${TEST_STATUS}
+          executionResult : ${ER_STATUS:-N/A}
+
+          Total Tests : ${TOTAL}
+          Passed      : ${PASSED}
+          Failed      : ${FAILED}
+          Skipped     : ${SKIPPED}
+
+          Browser     : ${BROWSER}
+          Environment : ${ENVIRONMENT}
+          Suites      : ${SUITE_TESTCASE}
+          Test Run ID : ${TEST_RUN_ID:-N/A}
+          Zip File    : ${ZIP_FILE}
+          S3 Location : ${S3_LOCATION}
+          Build URL   : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Reason:
+          EOF
+
+          if [ "$PIPELINE_STATUS" = "FAILED" ]; then
+            echo "Pipeline infrastructure failed before or after test execution."
+            echo "Check the failed step logs for details."
+          elif [ "$TEST_STATUS" = "PARTIAL_FAILED" ]; then
+            echo "Pipeline executed with partial validation failures."
+            echo "Valid suites/testcases ran; invalid ones are listed in metadata.json."
+          elif [ "$TEST_STATUS" = "FAILED" ]; then
+            echo "Pipeline executed successfully."
+            echo "Some test cases failed during execution."
+            echo "Please refer to the Playwright report for failure details."
+          elif [ "$TEST_STATUS" = "PASSED" ]; then
+            echo "Pipeline executed successfully."
+            echo "All Playwright test cases passed."
+          else
+            echo "Pipeline finished; test results were not available."
+          fi
+
+          echo "=================================================="
+          echo "⚠️ Workspace cleanup skipped for debugging."
+
+      - name: Pipeline success
+        if: success() && env.PARTIAL_TESTCASES != 'true' && env.HAS_INVALID_SUITES != 'true' && env.TEST_EXIT_CODE != '1'
+        run: echo "✅ Pipeline completed successfully!"
+
+      - name: Pipeline unstable
+        if: success() && (env.PARTIAL_TESTCASES == 'true' || env.HAS_INVALID_SUITES == 'true' || (env.TEST_EXIT_CODE != '' && env.TEST_EXIT_CODE != '0' && env.TEST_EXIT_CODE != 'N/A'))
+        run: echo "⚠️ Pipeline unstable - Some tests failed or partial validation occurred"
+
+      - name: Pipeline failure
+        if: failure()
+        run: echo "❌ Pipeline failed - Check logs for details"
+
+      - name: Pipeline cancelled
+        if: cancelled()
+        run: echo "🛑 Pipeline aborted by user"
