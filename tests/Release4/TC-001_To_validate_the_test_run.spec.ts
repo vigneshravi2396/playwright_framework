@@ -12,13 +12,12 @@ test(
     await test.step('#01 - Navigate to https://iassistant-qa.ideas2it.com/timesheet', async () => {
       await page.goto('https://iassistant-qa.ideas2it.com/timesheet');
     });
-    //Start - Module - Login to Iassistant
 
     await test.step('#02 - Click on the \'Enter Ideas2IT Email\' textbox', async () => {
       await page.getByRole("textbox", { name: "Enter Ideas2IT Email", exact: true }).click();
     });
 
-    await test.step('#03 - Enter email \'yogeshwar.sankaralingam@ideas2it.com\' in the \'Enter Ideas2IT Email\' field', async () => {
+    await test.step('#03 - Enter email \'gokul.velmurugan@ideas2it.com\' in the \'Enter Ideas2IT Email\' field', async () => {
       await page.getByRole("textbox", { name: "Enter Ideas2IT Email", exact: true }).fill('gokul.velmurugan@ideas2it.com');
     });
 
@@ -33,7 +32,6 @@ test(
     await test.step('#06 - Click the \'Login\' button', async () => {
       await page.getByRole("button", { name: "Login", exact: true }).click();
     });
-    //End - Module - Login to Iassistant
 
     await test.step('#07 - Click the \'+ Add Entry\' link', async () => {
       await page.locator('a:has-text("+ Add Entry")').click();
