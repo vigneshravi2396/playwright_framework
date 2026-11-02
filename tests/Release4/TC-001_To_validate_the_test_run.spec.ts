@@ -12,13 +12,14 @@ test(
     await test.step('#01 - Navigate to https://iassistant-qa.ideas2it.com/timesheet', async () => {
       await page.goto('https://iassistant-qa.ideas2it.com/timesheet');
     });
+    //Start - Module - Login to Iassistant
 
     await test.step('#02 - Click on the \'Enter Ideas2IT Email\' textbox', async () => {
       await page.getByRole("textbox", { name: "Enter Ideas2IT Email", exact: true }).click();
     });
 
     await test.step('#03 - Enter email \'yogeshwar.sankaralingam@ideas2it.com\' in the \'Enter Ideas2IT Email\' field', async () => {
-      await page.getByRole("textbox", { name: "Enter Ideas2IT Email", exact: true }).fill('yogeshwar.sankaralingam@ideas2it.com');
+      await page.getByRole("textbox", { name: "Enter Ideas2IT Email", exact: true }).fill('gokul.velmurugan@ideas2it.com');
     });
 
     await test.step('#04 - Click on the \'Enter the password\' textbox', async () => {
@@ -31,6 +32,47 @@ test(
 
     await test.step('#06 - Click the \'Login\' button', async () => {
       await page.getByRole("button", { name: "Login", exact: true }).click();
+    });
+    //End - Module - Login to Iassistant
+
+    await test.step('#07 - Click the \'+ Add Entry\' link', async () => {
+      await page.locator('a:has-text("+ Add Entry")').click();
+    });
+
+    await test.step('#08 - Click on the project dropdown input field', async () => {
+      await page.locator('#react-select-2-input').click();
+    });
+
+    await test.step('#09 - Select \'AllyGPO\' option from the dropdown', async () => {
+      await page.getByRole("option", { name: "AllyGPO", exact: true }).click();
+    });
+
+    await test.step('#10 - Click on the \'Enter No.of.Hours\' textbox', async () => {
+      await page.getByRole("textbox", { name: "Enter No.of.Hours", exact: true }).click();
+    });
+
+    await test.step('#11 - Click on the \'Enter No.of.Hours\' textbox again', async () => {
+      await page.getByRole("textbox", { name: "Enter No.of.Hours", exact: true }).click();
+    });
+
+    await test.step('#12 - Enter \'8\' in the \'Enter No.of.Hours\' field', async () => {
+      await page.getByRole("textbox", { name: "Enter No.of.Hours", exact: true }).fill('8');
+    });
+
+    await test.step('#13 - Click the \'Add Another Project - AllyGPO\' button', async () => {
+      await page.getByRole("button", { name: "Add Another Project - AllyGPO", exact: true }).click();
+    });
+
+    await test.step('#14 - Click the second \'Remove AllyGPO\' button', async () => {
+      await page.getByRole("button", { name: "Remove AllyGPO", exact: true }).nth(1).click();
+    });
+
+    await test.step('#15 - Click the \'Cancel\' button', async () => {
+      await page.getByRole("button", { name: "Cancel" }).click();
+    });
+
+    await test.step('#16 - Click the \'Cancel\' button again', async () => {
+      await page.getByRole("button", { name: "Cancel" }).click();
     });
 
   }
